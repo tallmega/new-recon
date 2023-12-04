@@ -240,7 +240,7 @@ def scan_domain(domain, input_ips):
 
     print('Running nuclei scans...')
     for domain in domains:
-        if domain['open_ports']:
+        if domain['open_ports'] and domain['open_ports'] != 'N/A':
             for port in domain['open_ports']:
                 target = f"{domain['subdomain']}:{port}"
                 application = run_nuclei(domain=domain['subdomain'], port=port)
