@@ -242,9 +242,10 @@ def scan_domain(domain, input_ips):
     for domain in domains:
         if domain['open_ports'] and domain['open_ports'] != 'N/A':
             for port in domain['open_ports']:
-                target = f"{domain['subdomain']}:{port}"
-                application = run_nuclei(domain=domain['subdomain'], port=port)
-                domain['application'].append(application)
+                if isinstance(port, int):  # Check if port is an integer
+                    target = f"{domain['subdomain']}:{port}"
+                    application = run_nuclei(domain=domain['subdomain'], port=port)
+                    domain['application'].append(application)
 
     #if output_file:
     #    write_csv(output_file, domains)
