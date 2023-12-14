@@ -204,7 +204,7 @@ def scan_domain(domain, input_ips, skip_scans):
             ip = ipaddress.ip_address(ip)
         except ValueError:
             continue
-        open_ports = scan_ports(ip, skip_scans, skip_scans)
+        open_ports = scan_ports(ip, skip_scans)
         #print (resolved_subdomains.get(str(ip), []))
         for subdomain in resolved_subdomains.get(str(ip), []):
             #print ("subdomain:")
