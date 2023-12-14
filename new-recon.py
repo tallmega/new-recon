@@ -138,7 +138,7 @@ def resolve_subdomains(subdomains, target_domain):
     return resolved_subdomains
 
 
-def scan_domain(domain, input_ips):
+def scan_domain(domain, input_ips, skip_scans):
     print(f'Enumerating subdomains for \'{domain}\' with subfinder...')
     with open(os.devnull, 'w') as devnull:
         subdomains = set(subprocess.check_output(['subfinder', '-d', domain, '-silent'],
@@ -204,7 +204,7 @@ def scan_domain(domain, input_ips):
             ip = ipaddress.ip_address(ip)
         except ValueError:
             continue
-        open_ports = scan_ports(ip, skip_scans)
+        open_ports = scan_ports(ip, skip_scans, skip_scans)
         #print (resolved_subdomains.get(str(ip), []))
         for subdomain in resolved_subdomains.get(str(ip), []):
             #print ("subdomain:")
@@ -256,10 +256,10 @@ def scan_domain(domain, input_ips):
 
     return domains
 
-def scan_domains(domains, input_ips):
+def scan_domains(domains, input_ips, skip_scans):
     all_domain_results = []
     for domain in domains:
-        domain_results = scan_domain(domain, input_ips)
+        domain_results = scan_domain(domain, input_ips, skip_scans)
         all_domain_results.extend(domain_results)
 
     return all_domain_results
