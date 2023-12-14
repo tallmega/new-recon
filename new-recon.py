@@ -66,7 +66,10 @@ def process_input_ips(input_ips, resolved_subdomains):
             domains.append(domain_info)
     return domains
 
-def scan_ports(ip):
+def scan_ports(ip, skip_scans):
+    if skip_scans:
+        return 'N/A'
+        
     print(f'Scanning {ip}...')
     open_ports = set()
     with open(os.devnull, 'w') as devnull:
@@ -201,7 +204,7 @@ def scan_domain(domain, input_ips):
             ip = ipaddress.ip_address(ip)
         except ValueError:
             continue
-        open_ports = scan_ports(ip)
+        open_ports = scan_ports(ip, skip_scans)
         #print (resolved_subdomains.get(str(ip), []))
         for subdomain in resolved_subdomains.get(str(ip), []):
             #print ("subdomain:")
@@ -238,14 +241,15 @@ def scan_domain(domain, input_ips):
         }
         domains.append(domain_info)
 
-    print('Running nuclei scans...')
-    for domain in domains:
-        if domain['open_ports'] and domain['open_ports'] != 'N/A':
-            for port in domain['open_ports']:
-                if isinstance(port, int):  # Check if port is an integer
-                    target = f"{domain['subdomain']}:{port}"
-                    application = run_nuclei(domain=domain['subdomain'], port=port)
-                    domain['application'].append(application)
+    if not skip_scans:
+        print('Running nuclei scans...')
+        for domain in domains:
+            if domain['open_ports'] and domain['open_ports'] != 'N/A':
+                for port in domain['open_ports']:
+                    if isinstance(port, int):  # Check if port is an integer
+                        target = f"{domain['subdomain']}:{port}"
+                        application = run_nuclei(domain=domain['subdomain'], port=port)
+                        domain['application'].append(application)
 
     #if output_file:
     #    write_csv(output_file, domains)
@@ -290,9 +294,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Automated enumeration and reconnaissance tool')
     parser.add_argument('domains', nargs='+', help='The target domains to scan')
     parser.add_argument('-i', '--input', help='A file containing IP addresses and address ranges to scan')
+    parser.add_argument('--skip-scans', action='store_true', help='Skip Nmap and Nuclei scans')
     args = parser.parse_args()
 
     input_ips = process_input_file(args.input) if args.input else set()
-    domains = scan_domains(args.domains, input_ips)
+    domains = scan_domains(args.domains, input_ips, args.skip_scans)
     output_file = f"{args.domains[0]}_output.csv"  # Uses the first domain for the output file name
     write_csv(output_file, domains)
