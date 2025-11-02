@@ -66,10 +66,10 @@ def process_input_ips(input_ips, resolved_subdomains):
             domains.append(domain_info)
     return domains
 
-def scan_ports(ip, skip_scans):
+def scan_ports(ip, skip_scans=False):
     if skip_scans:
-        return 'N/A'
-        
+        return 'N/A'  # never iterated over in write_csv
+
     print(f'Scanning {ip}...')
     open_ports = set()
     with open(os.devnull, 'w') as devnull:
@@ -214,23 +214,24 @@ def scan_domain(domain, input_ips, skip_scans):
             #print ("open ports:")
             #print (open_ports)
             if open_ports:
-                 domain_info = {
-                     'ip': ip,
-                     'subdomain': subdomain,
-                     'open_ports': open_ports,
-                     'application': []
-                 }
+                domain_info = {
+                    'ip': ip,
+                    'subdomain': subdomain,
+                    'open_ports': open_ports,
+                    'application': []
+                }
             else:
-                 domain_info = {
-                     'ip': ip,
-                     'subdomain': subdomain,
-                     'open_ports': None,
-                     'application': []
-                 }
+                domain_info = {
+                    'ip': ip,
+                    'subdomain': subdomain,
+                    'open_ports': set(),   # was None
+                    'application': []
+                }
             #print ("domain_info:")
             #print (domain_info)
             domains.append(domain_info)
-            domains.extend(process_input_ips(input_ips, resolved_subdomains))
+            
+        domains.extend(process_input_ips(input_ips, resolved_subdomains))
 
     for cname, subdomains in cnames.items():
         domain_info = {
@@ -281,14 +282,46 @@ def write_csv(output_file, domains):
         # write to CSV
         for ip, subdomain_list in subdomains_by_ip.items():
             domains_str = ', '.join(sorted(set([d['subdomain'] for d in subdomain_list])))
-            #domains_str = ', '.join([d['subdomain'] for d in subdomain_list])
-            if subdomain_list[0]['open_ports']:
-                open_ports = ', '.join(sorted(set([str(p) for d in subdomain_list for p in d['open_ports']])))
-                #open_ports = ', '.join(sorted([str(p) for d in subdomain_list for p in d['open_ports']], key=int))
+
+            # --- Robust open_ports rendering ---
+            any_scanned = False
+            ports_union = set()
+            all_na = True
+
+            for d in subdomain_list:
+                op = d.get('open_ports')
+                # 'N/A' means not scanned for that entry
+                if isinstance(op, str) and op.upper() == 'N/A':
+                    continue
+                all_na = False  # at least one entry is scanned (set() or set of ports or None)
+
+                if isinstance(op, (set, list, tuple)):
+                    any_scanned = True
+                    ports_union.update(op)
+                elif op is None:
+                    any_scanned = True  # scanned but no ports found (older entries)
+                else:
+                    # handle single ints or odd values defensively
+                    try:
+                        ports_union.add(int(op))
+                        any_scanned = True
+                    except Exception:
+                        pass
+
+            if all_na:
+                open_ports_str = 'N/A'          # everything was skipped
             else:
-                open_ports = 'None'
-            application = ', '.join(sorted(list(set(a for d in subdomain_list for a in d['application'] if a))))
-            writer.writerow({'Domain': domains_str, 'IP': ip, 'Open Ports': open_ports, 'Application': application})
+                if ports_union:
+                    open_ports_str = ', '.join(sorted(str(p) for p in ports_union))
+                else:
+                    open_ports_str = 'None'      # scanned, but no open ports overall
+
+            # Application column (unchanged)
+            application = ', '.join(sorted(list(set(
+                a for d in subdomain_list for a in d['application'] if a
+            ))))
+            writer.writerow({'Domain': domains_str, 'IP': ip, 'Open Ports': open_ports_str, 'Application': application})
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Automated enumeration and reconnaissance tool')
