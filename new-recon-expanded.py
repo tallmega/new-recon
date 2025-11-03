@@ -137,7 +137,7 @@ def scan_ports(ip, skip_scans=False):
     with open(os.devnull, 'w') as devnull:
         try:
             result = subprocess.run(
-                ['nmap', '-Pn', '-p', '1-65535', '--host-timeout', '45m', str(ip)],
+                ['nmap', '-Pn', '-p', '1-65535', '--host-timeout', '1m', str(ip)],
                 stdout=subprocess.PIPE, stderr=devnull, encoding='utf-8', check=False
             )
         except FileNotFoundError:
