@@ -120,7 +120,8 @@ def write_csv(output_path: str, ports_by_ip: Dict[str, Set[str]]) -> int:
         w.writerow(["IP", "Ports"])
         for ip in sort_ips_numerically(list(ports_by_ip.keys())):
             ports_list = sorted(ports_by_ip[ip], key=lambda p: int(p)) if ports_by_ip[ip] else []
-            w.writerow([ip, ",".join(ports_list)])
+            # Add tcp/ prefix to each port here
+            w.writerow([ip, ",".join(f"tcp/{p}" for p in ports_list)])
             rows += 1
     return rows
 
