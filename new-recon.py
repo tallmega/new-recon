@@ -1,478 +1,223 @@
 #!/usr/bin/env python3
-import argparse
-import re
-import csv
-import ipaddress
-import signal
-import os
-import socket
-import subprocess
-import sys
-import time
-import json
+import argparse, csv, ipaddress, os, re, socket, subprocess, sys
 from collections import defaultdict
+from functools import lru_cache
 import dns.resolver
 
+# ---------- helpers ----------
 def expand_cidr(cidr):
+    try: return [str(ip) for ip in ipaddress.ip_network(cidr, strict=False)]
+    except Exception: return []
+
+def process_input_file(path):
+    s=set()
+    with open(path) as f:
+        for l in f:
+            l=l.strip()
+            if not l: continue
+            s.update(expand_cidr(l) if '/' in l else [l])
+    return s
+
+def is_ip(v):
+    try: ipaddress.ip_address(v); return True
+    except: return False
+
+def ip_sort_key(v):
     try:
-        return [str(ip) for ip in ipaddress.ip_network(cidr, strict=False)]
-    except ValueError:
-        return []
+        ip=ipaddress.ip_address(v)
+        return (0 if ip.version==4 else 1,int(ip))
+    except: return (2,v)
 
-def process_input_file(input_file_path):
-    input_ips = set()
-    with open(input_file_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if '/' in line:
-                input_ips.update(expand_cidr(line))
-            else:
-                input_ips.add(line)
-    return input_ips
-
-def resolve_subdomains(subdomains, target_domain):
-    resolved_subdomains = defaultdict(set)
-    for subdomain in subdomains:
-        try:
-            ip_addresses = set(socket.gethostbyname_ex(subdomain.rstrip('.'))[2])
-            for ip in ip_addresses:
-                resolved_subdomains[ip].add(subdomain)
-        except (socket.gaierror, ValueError):
-            # keep behaviour of notifying the user
-            print(f"Error resolving subdomain {subdomain}: host not found")
-    return resolved_subdomains
-
-def process_input_ips(input_ips, resolved_subdomains):
-    """
-    Build domain entries for IPs that came from the input file.
-    - If an input IP is present in resolved_subdomains, we attach the subdomains and mark open_ports as set() (not scanned yet).
-    - If input IP has no matching subdomain, mark open_ports as 'N/A' (not scanned).
-    """
-    domains = []
-    for ip in sorted(input_ips):
-        try:
-            ip_obj = ipaddress.ip_address(ip)
-        except ValueError:
-            # keep any non-IP (shouldn't happen here) as-is
-            ip_str = ip
-            # treat as not-scanned
-            domains.append({
-                'ip': ip_str,
-                'subdomain': '',
-                'open_ports': 'N/A',
-                'application': []
-            })
-            continue
-
-        if str(ip_obj) in resolved_subdomains:
-            domains.append({
-                'ip': ip_obj,
-                'subdomain': ', '.join(sorted(resolved_subdomains[str(ip_obj)])),
-                'open_ports': set(),   # scanned (conceptually) but no scan performed yet — will be interpreted as "scanned but no ports" unless updated
-                'application': []
-            })
-        else:
-            domains.append({
-                'ip': ip_obj,
-                'subdomain': '',
-                'open_ports': 'N/A',   # explicitly not scanned
-                'application': []
-            })
-    return domains
-
-def scan_ports(ip, skip_scans=False):
-    """
-    Returns:
-      - 'N/A' (string) if skip_scans True
-      - set() if nmap ran and there were no open ports
-      - set([ports...]) if open ports found
-    """
-    if skip_scans:
-        return 'N/A'
-
-    print(f'Scanning {ip}...')
-    open_ports = set()
-    with open(os.devnull, 'w') as devnull:
-        try:
-            result = subprocess.run(
-                ['nmap', '-Pn', '--top-ports', '500', str(ip)],
-                stdout=subprocess.PIPE, stderr=devnull, encoding='utf-8', check=False
-            )
-        except FileNotFoundError:
-            print("nmap not found in PATH. Skipping scan for", ip)
-            return 'N/A'
-
-        lines = result.stdout.splitlines()
-        for line in lines:
-            # nmap's output has many lines; check for "open" state, but avoid "filtered" or other words
-            # We'll do a conservative parse: lines that start with digits followed by '/' and 'open' somewhere
-            parts = line.strip().split()
-            if not parts:
-                continue
-            # naive pattern: "<port>/<proto>  open  service"
-            m = re.match(r'^(\d+)\/', parts[0])
-            if m and 'open' in line:
-                try:
-                    port = int(m.group(1))
-                    open_ports.add(port)
-                except Exception:
-                    pass
-    return open_ports  # possibly empty set
-
-def run_nuclei(domain, port):
+def proto_port_sort_key(p):
     try:
-        print(f'Running nuclei on {domain}:{port}...')
-        command = "nuclei -silent -nc -t exposed-panels/ -t technologies/ -u {0}:{1}".format(domain, port)
-        process = subprocess.Popen(command.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output, error = process.communicate()
+        proto,port=p.split('/')
+        return (int(port),proto)
+    except: return (99999,p)
+
+# ---------- dns ----------
+@lru_cache(maxsize=10000)
+def resolve_cname_chain(t):
+    cur=t.rstrip('.'); seen=set()
+    while True:
+        if cur in seen: break
+        seen.add(cur)
         try:
-            output = output.decode('utf-8').strip()
-        except Exception:
-            output = ''
-        if output:
-            print(output)
-            return output
-        return ''
-    except subprocess.CalledProcessError as e:
-        try:
-            return {'error': e.output.decode('utf-8')}
-        except Exception:
-            return {'error': str(e)}
-    except KeyboardInterrupt:
-        print(f"\nNuclei scan on {domain}:{port} was interrupted by user.")
-        return ''
+            ans=dns.resolver.resolve(cur,'CNAME')
+            if ans: cur=str(ans[0].target).rstrip('.'); continue
+        except (dns.resolver.NoAnswer,dns.resolver.NXDOMAIN,
+                dns.resolver.Timeout,dns.resolver.NoNameservers):
+            pass
+        break
+    return cur
 
-def resolve_subdomains_with_cname_handling(subdomains, target_domain):
-    """
-    More complete resolve_subdomains which handles CNAMEs that point outside the target domain.
-    Returns mapping: key -> set(subdomains)
-    where key is either IP (string) or external CNAME target (string)
-    """
-    resolved_subdomains = defaultdict(set)
-    for subdomain in subdomains:
-        non_target_cname = set()
-        try:
-            cname_records = set()
-            try:
-                cname_answers = dns.resolver.resolve(subdomain.rstrip('.'), 'CNAME')
-            except dns.resolver.NoAnswer:
-                cname_answers = []
-            except dns.resolver.Timeout:
-                cname_answers = []
-                print(f"Error resolving subdomain {subdomain}: Name Server Timeout")
-            except dns.resolver.NoNameservers:
-                cname_answers = []
-                print(f"Error resolving subdomain {subdomain}: No Nameservers/DNSSEC Fail")
+@lru_cache(maxsize=10000)
+def resolve_a_aaaa(t):
+    a,aaaa=[],[]
+    t=t.rstrip('.')
+    try: a=[str(r) for r in dns.resolver.resolve(t,'A')]
+    except: pass
+    try: aaaa=[str(r) for r in dns.resolver.resolve(t,'AAAA')]
+    except: pass
+    return a,aaaa
 
-            for cname in cname_answers:
-                # dns.resolver returns rdata; format as string
-                cname_records.add(str(cname.target).rstrip('.'))
+def choose_ips_for_fqdn(fqdn,scan_all=False,input_ips=None,prefer_input_ip=False):
+    input_ips=input_ips or set()
+    final=resolve_cname_chain(fqdn)
+    a,aaaa=resolve_a_aaaa(final)
+    all_ips=a+aaaa
+    if not all_ips:
+        try: all_ips=socket.gethostbyname_ex(fqdn)[2]
+        except: return []
+    if prefer_input_ip:
+        for ip in sorted(all_ips,key=ip_sort_key):
+            if ip in input_ips:
+                return [ip] if not scan_all else sorted(all_ips,key=ip_sort_key)
+    if scan_all: return sorted(all_ips,key=ip_sort_key)
+    v4=[i for i in all_ips if ipaddress.ip_address(i).version==4]
+    v6=[i for i in all_ips if ipaddress.ip_address(i).version==6]
+    if v4: return [sorted(v4,key=ip_sort_key)[0]]
+    if v6: return [sorted(v6,key=ip_sort_key)[0]]
+    return [sorted(all_ips,key=ip_sort_key)[0]]
 
-            for cname in cname_records:
-                # If the CNAME target doesn't end with the target domain, treat it as "external"
-                if not cname.endswith(target_domain.rstrip('.')):
-                    non_target_cname.add(cname)
-
-        except (dns.resolver.NXDOMAIN, ValueError):
-            print(f"Error resolving subdomain {subdomain}: host not found")
-
-        if non_target_cname:
-            for cname in non_target_cname:
-                resolved_subdomains[cname].add(subdomain)
-        else:
-            try:
-                ip_addresses = set(socket.gethostbyname_ex(subdomain.rstrip('.'))[2])
-                for ip in ip_addresses:
-                    resolved_subdomains[ip].add(subdomain)
-            except (socket.gaierror, ValueError):
-                # keep the original behaviour of printing errors
-                print(f"Error resolving subdomain {subdomain}: host not found")
-    return resolved_subdomains
-
-def scan_domain(domain, input_ips, skip_scans=False):
-    """
-    Scans one parent domain:
-      - runs subfinder
-      - runs gobuster depending on wildcard
-      - resolves subdomains (IP or external CNAME targets)
-      - scans IPs (unless skip_scans)
-      - gathers CNAMES as not-scanned entries
-      - returns list of domain_info dicts
-    """
-    print(f'Enumerating subdomains for \'{domain}\' with subfinder...')
+# ---------- scanning ----------
+def scan_ports(ip,skip=False,nmap_top_ports=500,nmap_timeout="90s"):
+    if skip: return 'N/A'
+    ip_str=str(ip)
+    try: is6=ipaddress.ip_address(ip_str).version==6
+    except: return 'N/A'
+    cmd=['nmap','-Pn','--top-ports',str(nmap_top_ports),
+         '--host-timeout',str(nmap_timeout),ip_str]
+    if is6: cmd.insert(1,'-6')
+    print(f"[i] Scanning {ip_str} (top {nmap_top_ports})")
+    ports=set()
     try:
-        with open(os.devnull, 'w') as devnull:
-            subfinder_out = subprocess.check_output(['subfinder', '-d', domain, '-silent'], stderr=devnull, encoding='utf-8')
-            subdomains = set(subfinder_out.split())
+        out=subprocess.run(cmd,stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL,
+                           encoding='utf-8').stdout
+        for line in out.splitlines():
+            m=re.match(r"^(\d+)\/([a-zA-Z]+)\s+open",line)
+            if m: ports.add(f"{m.group(2).lower()}/{m.group(1)}")
     except FileNotFoundError:
-        print("subfinder not found in PATH. No subdomain enumeration performed.")
-        subdomains = set()
-    except subprocess.CalledProcessError:
-        subdomains = set()
+        print("[!] nmap not found"); return 'N/A'
+    return ports
 
-    print(f'Found {len(subdomains)} subdomains for \'{domain}\'')
-
-    # check for wildcard dns
-    wildcard_detected = False
+def format_target(h,p):
     try:
-        domain_ips = set(socket.gethostbyname_ex(f"randomstring700000.{domain.rstrip('.')}")[2])
-        random_subdomain_ips = set(socket.gethostbyname_ex(f"randomstring123.{domain.rstrip('.')}")[2])
-        if domain_ips == random_subdomain_ips:
-            wildcard_detected = True
-    except (socket.gaierror, ValueError):
-        pass
+        if ipaddress.ip_address(h).version==6:
+            return f"[{h}]:{p}"
+    except: pass
+    return f"{h}:{p}"
 
-    if wildcard_detected:
-        print('Wildcard DNS detected. Running gobuster with wildcard option...')
-        try:
-            with open(os.devnull, 'w') as devnull:
-                gobuster_output = subprocess.check_output(
-                    ['gobuster', 'dns', '-d', f'{domain}', '-o', '/dev/null', '--wildcard',
-                     '-w', './SecLists/Discovery/DNS/subdomains-top1million-20000.txt', '-q', '-r', '1.0.0.1'],
-                    stderr=devnull, encoding='utf-8'
-                )
-                gobuster_lines = [line.strip() for line in gobuster_output.split('\n') if line.strip()]
-                matching_lines = [line for line in gobuster_lines if line.endswith(domain)]
-                prefix = "\x1b[2KFound: "
-                cleaned_lines = [line.strip()[len(prefix):] for line in matching_lines if line.strip().startswith(prefix)]
-                subdomains = set(cleaned_lines)
-        except Exception:
-            # if gobuster or wordlist missing, continue with subfinder results
-            pass
-    else:
-        # run gobuster to get more subdomains
-        print(f'Running gobuster on \'{domain}\'...')
-        try:
-            with open(os.devnull, 'w') as devnull:
-                gobuster_output = subprocess.check_output(
-                    ['gobuster', 'dns', '-d', f'{domain}', '-o', '/dev/null',
-                     '-w', './SecLists/Discovery/DNS/subdomains-top1million-5000.txt', '-q', '-r', '1.0.0.1'],
-                    stderr=devnull, encoding='utf-8'
-                )
-                gobuster_lines = [line.strip() for line in gobuster_output.split('\n') if line.strip()]
-                matching_lines = [line for line in gobuster_lines if line.endswith(domain)]
-                prefix = "\x1b[2KFound: "
-                cleaned_lines = [line.strip()[len(prefix):] for line in matching_lines if line.strip().startswith(prefix)]
-                gobuster_subdomains = set(cleaned_lines)
-                subdomains |= gobuster_subdomains
-        except Exception:
-            # gobuster missing or failing - keep subfinder results
-            pass
-
-    subdomains = sorted(set(subdomains))
-    resolved_subdomains = resolve_subdomains_with_cname_handling(subdomains, domain)
-
-    # Separate cnames vs IPs for later inclusion
-    cnames = {}
-    ips_map = {}
-    for k, v in resolved_subdomains.items():
-        try:
-            ip_obj = ipaddress.ip_address(k)
-            # keep only global IPs (mirrors your previous logic)
-            if ip_obj.is_global:
-                ips_map[str(k)] = v
-        except ValueError:
-            # k isn't an IP — treat as a CNAME (external)
-            cnames[k] = v
-
-    # Build the set of keys to iterate: include resolved keys (IPs + cnames) plus any user-provided input IPs
-    keys_to_scan = set(resolved_subdomains.keys()) | set(input_ips)
-
-    print('Running port scan on IPs...')
-    domains = []
-
-    # For each key, attempt to treat it as an IP. If it's not an IP (i.e. CNAME), we'll skip scanning it here.
-    for key in sorted(keys_to_scan):
-        # skip empty
-        if not key:
-            continue
-
-        try:
-            ip_obj = ipaddress.ip_address(key)
-        except ValueError:
-            # key is not an IP (likely a CNAME). We'll add it later when adding cnames.
-            continue
-
-        open_ports = scan_ports(ip_obj, skip_scans)
-
-        # If there are subdomains mapped to this IP, create one row *per subdomain* (keeps previous behaviour)
-        mapped_subs = resolved_subdomains.get(str(ip_obj), [])
-        if mapped_subs:
-            for subdomain in sorted(mapped_subs):
-                if isinstance(open_ports, str) and open_ports == 'N/A':
-                    # not-scanned entry
-                    domain_info = {
-                        'ip': ip_obj,
-                        'subdomain': subdomain,
-                        'open_ports': 'N/A',
-                        'application': []
-                    }
-                else:
-                    # scanned (open_ports is a set, possibly empty)
-                    domain_info = {
-                        'ip': ip_obj,
-                        'subdomain': subdomain,
-                        'open_ports': open_ports if isinstance(open_ports, set) else set(),
-                        'application': []
-                    }
-                domains.append(domain_info)
-        else:
-            # No mapped subdomains for this IP. If input provided this IP, we want the input row (N/A or scanned)
-            if str(ip_obj) in input_ips:
-                if isinstance(open_ports, str) and open_ports == 'N/A':
-                    domain_info = {
-                        'ip': ip_obj,
-                        'subdomain': '',
-                        'open_ports': 'N/A',
-                        'application': []
-                    }
-                else:
-                    domain_info = {
-                        'ip': ip_obj,
-                        'subdomain': '',
-                        'open_ports': open_ports if isinstance(open_ports, set) else set(),
-                        'application': []
-                    }
-                domains.append(domain_info)
-            else:
-                # This IP came from DNS resolution but had no subdomain (unlikely); skip unless scanned and has ports.
-                if isinstance(open_ports, set) and open_ports:
-                    domains.append({
-                        'ip': ip_obj,
-                        'subdomain': '',
-                        'open_ports': open_ports,
-                        'application': []
-                    })
-                # otherwise skip (we don't include scanned-but-empty IPs without a subdomain unless they were in input_ips)
-
-    # Add process_input_ips results ONCE (so input-only IPs get their 'N/A' entries if not present)
-    domains.extend(process_input_ips(input_ips, resolved_subdomains))
-
-    # Add CNAMES (external targets) as rows (not scanned)
-    for cname_key, subdomains_set in cnames.items():
-        domains.append({
-            'ip': cname_key,
-            'subdomain': ', '.join(sorted(subdomains_set)),
-            'open_ports': 'N/A',
-            'application': []
-        })
-
-    # Nuclei scanning (only when not skipped)
-    if not skip_scans:
-        print('Running nuclei scans...')
-        for d in domains:
-            op = d.get('open_ports')
-            # we only nuclei-scan if op is a set with ints
-            if isinstance(op, (set, list, tuple)) and op:
-                for port in sorted(op):
-                    if isinstance(port, int):
-                        application = run_nuclei(domain=d['subdomain'] or str(d['ip']), port=port)
-                        if application:
-                            d['application'].append(application)
-
-    return domains
-
-def scan_domains(domains_list, input_ips, skip_scans=False):
-    all_domain_results = []
-    for domain in domains_list:
-        domain_results = scan_domain(domain, input_ips, skip_scans)
-        all_domain_results.extend(domain_results)
-    return all_domain_results
-
-def write_csv(output_file, domains):
-    """
-    Writes CSV with fields: ['Domain','IP','Open Ports','Application'].
-    - Always creates/overwrites the file, even if domains is empty (header only).
-    - Same rendering semantics you expect for 'Open Ports' handled upstream.
-    """
-    rows_written = 0
+def run_nuclei(host,port):
+    target=format_target(host,port)
     try:
-        with open(output_file, 'w', newline='\n') as csvfile:
-            fieldnames = ['Domain', 'IP', 'Open Ports', 'Application']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
+        proc=subprocess.Popen(
+            ["nuclei","-silent","-nc","-t","exposed-panels/","-t","technologies/","-u",target],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    except FileNotFoundError: return ''
+    out,_=proc.communicate()
+    txt=out.decode(errors='ignore').strip()
+    if not txt: return ''
+    # Filter nuclei output for meaningful tags
+    tags=set()
+    for line in txt.splitlines():
+        for t in re.findall(r'\[([^\]]+)\]',line):
+            tl=t.lower()
+            if any(x in tl for x in ['http','info','ssl','tcp','udp']): continue
+            parts=tl.split(':')
+            tags.add(parts[-1])
+    return ', '.join(sorted(tags))
 
-            # group subdomains by IP address or CNAME record (stringify ip for consistent keys)
-            subdomains_by_ip = {}
-            for domain in domains:
-                ip_key = str(domain['ip'])
-                subdomains_by_ip.setdefault(ip_key, []).append(domain)
+# ---------- csv ----------
+def write_csv(outfile,data):
+    with open(outfile,'w',newline='\n') as f:
+        fn=['DNS','IP / Hosting Provider','Ports','Nuclei','Notes']
+        w=csv.DictWriter(f,fieldnames=fn); w.writeheader()
+        for ip,recs in sorted(data.items(),key=lambda x:ip_sort_key(x[0])):
+            dns=', '.join(sorted(set(r['dns'] for r in recs if r['dns'])))
+            ports=set(); nuc=set(); all_na=True
+            for r in recs:
+                op=r['ports']
+                if isinstance(op,str) and op=='N/A': continue
+                all_na=False
+                if isinstance(op,set): ports|=op
+                if r['nuclei']: nuc|={r['nuclei']}
+            ports_str='N/A' if all_na else ('None' if not ports else ', '.join(sorted(ports,key=proto_port_sort_key)))
+            nuc_str=', '.join(sorted(x for x in nuc if x))
+            w.writerow({'DNS':dns,'IP / Hosting Provider':ip,'Ports':ports_str,'Nuclei':nuc_str,'Notes':''})
+    print(f"[i] CSV written: {outfile}")
 
-            for ip_key, subdomain_list in sorted(subdomains_by_ip.items(), key=lambda x: x[0]):
-                domains_str = ', '.join(sorted(set(d['subdomain'] for d in subdomain_list if d['subdomain'])))
-
-                all_na = True
-                ports_union = set()
-
-                for d in subdomain_list:
-                    op = d.get('open_ports')
-                    if isinstance(op, str) and op.upper() == 'N/A':
-                        continue
-                    all_na = False
-                    if isinstance(op, set):
-                        ports_union.update(op)
-                    elif op is None:
-                        # scanned but no ports; leave union empty
-                        pass
-                    else:
-                        try:
-                            ports_union.add(int(op))
-                        except Exception:
-                            pass
-
-                if all_na:
-                    open_ports_str = 'N/A'
-                else:
-                    open_ports_str = ', '.join(sorted(str(p) for p in ports_union)) if ports_union else 'None'
-
-                application = ', '.join(sorted(list(set(
-                    a for d in subdomain_list for a in d['application'] if a
-                ))))
-
-                writer.writerow({'Domain': domains_str, 'IP': ip_key, 'Open Ports': open_ports_str, 'Application': application})
-                rows_written += 1
-    except Exception as e:
-        print(f"[!] Failed to write CSV to {output_file}: {e}")
-        raise
-    abs_path = os.path.abspath(output_file)
-    print(f"[i] CSV written: {abs_path} ({rows_written} data row(s) + header)")
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Automated enumeration and reconnaissance tool')
-    parser.add_argument('domains', nargs='+', help='The target domains to scan')
-    parser.add_argument('-i', '--input', help='A file containing IP addresses and address ranges to scan')
-    parser.add_argument('--skip-scans', action='store_true', help='Skip Nmap and Nuclei scans')
-    args = parser.parse_args()
-
-    # Build output path up-front and show it
-    output_file = os.path.abspath(f"new-recon-{args.domains[0]}_output.csv")
-    print(f"[i] Output will be written to: {output_file}")
-
+# ---------- domain scan ----------
+def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False,
+                nmap_top_ports=500,nmap_timeout="90s",nuclei_single_web_port=True):
+    print(f"[i] Enumerating {domain}")
+    subs=set()
     try:
-        input_ips = process_input_file(args.input) if args.input else set()
-        domains = scan_domains(args.domains, input_ips, args.skip_scans)
+        out=subprocess.check_output(["subfinder","-d",domain,"-silent"],
+                                    encoding='utf-8',stderr=subprocess.DEVNULL)
+        subs|=set(out.split())
+    except: pass
 
-        # Safety: domains might be empty; we still write header so there is a file
-        write_csv(output_file, domains)
-    except KeyboardInterrupt:
-        print("\n[!] Aborted by user")
-        # still try to write anything we collected so far if variable exists
-        try:
-            if 'domains' in locals():
-                write_csv(output_file, domains)
-        except Exception:
-            pass
-        sys.exit(1)
-    except Exception as e:
-        print(f"[!] Fatal error: {e}")
-        # If you want a traceback for debugging uncomment:
-        # import traceback; traceback.print_exc()
-        # Still write whatever we have, if available
-        try:
-            if 'domains' in locals():
-                write_csv(output_file, domains)
-        except Exception:
-            pass
-        sys.exit(1)
+    results=defaultdict(list)
+    for s in sorted(subs):
+        ips=choose_ips_for_fqdn(s,scan_all,input_ips,prefer_input_ip)
+        for ip in ips:
+            results[str(ip)].append({'dns':s,'ports':set(),'nuclei':''})
+    for i in input_ips:
+        if is_ip(i): results.setdefault(i,[])
+
+    # nmap
+    scanres={ip:scan_ports(ip,skip,nmap_top_ports,nmap_timeout) for ip in results}
+    for ip,recs in results.items():
+        for r in recs: r['ports']=scanres[ip]
+
+    if not skip:
+        print("[i] Running nuclei (smart single-port mode)" if nuclei_single_web_port else "[i] Running nuclei full mode")
+        for ip,recs in results.items():
+            op=scanres[ip]
+            if not isinstance(op,set) or not op: continue
+            chosen=None
+            if nuclei_single_web_port:
+                for cand in [443,8443,80,8080]:
+                    if f"tcp/{cand}" in op: chosen=cand; break
+                if not chosen:
+                    try:
+                        _,chosen=next(iter(sorted(op,key=proto_port_sort_key))).split('/')
+                        chosen=int(chosen)
+                    except: continue
+                op={f"tcp/{chosen}"}
+            for pp in sorted(op,key=proto_port_sort_key):
+                try:
+                    _,portnum=pp.split('/')
+                    portnum=int(portnum)
+                except: continue
+                out=run_nuclei(ip,portnum)
+                if out:
+                    for r in recs: r['nuclei']=out
+    return results
+
+# ---------- main ----------
+if __name__=="__main__":
+    p=argparse.ArgumentParser()
+    p.add_argument("domains",nargs="+")
+    p.add_argument("-i","--input")
+    p.add_argument("--skip-scans",action="store_true")
+    p.add_argument("--scan-all-ips-per-fqdn",action="store_true")
+    p.add_argument("--prefer-input-ip",action="store_true")
+    p.add_argument("--nmap-top-ports",type=int,default=500)
+    p.add_argument("--nmap-timeout",default="90s")
+    p.add_argument("--nuclei-single-web-port",action="store_true",default=True)
+    a=p.parse_args()
+
+    ips=process_input_file(a.input) if a.input else set()
+    allres=defaultdict(list)
+    for d in a.domains:
+        r=scan_domain(d,ips,skip=a.skip_scans,
+                      scan_all=a.scan_all_ips_per_fqdn,
+                      prefer_input_ip=a.prefer_input_ip,
+                      nmap_top_ports=a.nmap_top_ports,
+                      nmap_timeout=a.nmap_timeout,
+                      nuclei_single_web_port=a.nuclei_single_web_port)
+        for ip,recs in r.items(): allres[ip].extend(recs)
+    outfile=f"{a.domains[0]}_output.csv"
+    write_csv(outfile,allres)

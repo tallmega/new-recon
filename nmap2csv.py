@@ -137,27 +137,36 @@ def try_resolve_hostname(name: str) -> Set[str]:
         pass
     return ips
 
-def build_input_ip_map(inputs: List[str]) -> Tuple[Dict[str, Set[str]], List[Tuple[ipaddress._BaseNetwork, str]]]:
+def build_input_ip_map(inputs: List[str]) -> Tuple[
+    Dict[str, Set[str]],                       # ip_to_inputs
+    List[Tuple[ipaddress._BaseNetwork, str]],  # cidr_list
+    Dict[str, Set[str]],                       # name_to_ips
+    Set[str],                                  # unresolved_names
+]:
     """
     Given a list of input strings, return:
       - ip_to_inputs: { ip_str -> set(input_strings) } for exact-IP and resolved hostnames
-      - cidr_list: list of tuples (network_object, original_input_string) for CIDR inputs
-    Note: input list order is preserved when writing CSV (we will join multiple input names with ';').
+      - cidr_list:    list of (network_object, original_input_string) for CIDR inputs
+      - name_to_ips:  { input_name (usually FQDN) -> set(ip_str) } for hostnames we resolved (and IP literals)
+      - unresolved_names: set of input names that didn't resolve to any IP
     """
     ip_to_inputs: Dict[str, Set[str]] = collections.defaultdict(set)
     cidr_list: List[Tuple[ipaddress._BaseNetwork, str]] = []
+    name_to_ips: Dict[str, Set[str]] = collections.defaultdict(set)
+    unresolved_names: Set[str] = set()
 
     for inp in inputs:
-        # try exact IP
+        # exact IP?
         try:
             ipobj = ipaddress.ip_address(inp)
             ip_str = str(ipobj)
             ip_to_inputs[ip_str].add(inp)
+            name_to_ips[inp].add(ip_str)  # treat an IP input as "name" mapping to itself
             continue
         except Exception:
             pass
 
-        # try CIDR/network
+        # CIDR?
         try:
             net = ipaddress.ip_network(inp, strict=False)
             cidr_list.append((net, inp))
@@ -165,19 +174,17 @@ def build_input_ip_map(inputs: List[str]) -> Tuple[Dict[str, Set[str]], List[Tup
         except Exception:
             pass
 
-        # otherwise treat as hostname/FQDN -> resolve A/AAAA
+        # assume hostname/FQDN
         resolved = try_resolve_hostname(inp)
         if resolved:
             for rip in resolved:
                 ip_to_inputs[rip].add(inp)
+                name_to_ips[inp].add(rip)
         else:
-            # If resolution failed, we still want the input listed in output for visibility
-            # but without mapping to an IP. We'll handle that later by ensuring it's present in
-            # the set of input-only names (so it's not lost).
-            # For now, mark a special key "__UNRESOLVED__:"+inp to ensure it's known.
-            ip_to_inputs[f"__UNRESOLVED__:{inp}"].add(inp)
+            unresolved_names.add(inp)
 
-    return ip_to_inputs, cidr_list
+    return ip_to_inputs, cidr_list, name_to_ips, unresolved_names
+
 
 # --- Helpers ---------------------------------------------------------------
 def include_up_hosts_without_ports(nmap_output_all: str, ports_by_ip: Dict[str, Set[str]]) -> None:
@@ -213,80 +220,103 @@ def ips_in_cidr_mappings(ip: str, cidr_list: List[Tuple[ipaddress._BaseNetwork, 
     return matches
 
 # --- CSV writer ------------------------------------------------------------
-def write_csv(output_path: str, ports_by_ip: Dict[str, Set[str]], names_by_ip: Dict[str, str],
-              ip_to_inputs: Dict[str, Set[str]], cidr_list: List[Tuple[ipaddress._BaseNetwork, str]],
-              all_inputs_ordered: List[str]) -> int:
+def write_csv(output_path: str,
+              ports_by_ip: Dict[str, Set[str]],
+              names_by_ip: Dict[str, str],   # unused for precedence, kept for compatibility
+              ip_to_inputs: Dict[str, Set[str]],
+              cidr_list: List[Tuple[ipaddress._BaseNetwork, str]],
+              all_inputs_ordered: List[str],
+              name_to_ips: Dict[str, Set[str]],
+              unresolved_names: Set[str]) -> int:
     """
-    Write CSV: Name,IP,Ports
-    Name is derived from (in order of preference):
-      1) input strings that map to the IP (exact IP mapping or resolved hostname), joined with ';' in input order
-      2) CIDR inputs that contain the IP (joined ';' in input order)
-      3) (optional) names_by_ip (reverse lookup) -- we leave blank if none of the above exist, per your request.
-    Also include any unresolved input names (from -iL) that had no mapped IPs as rows with empty IP/Ports.
-    """
-    # Build a map ip -> list of input names in the original input order
-    ip_to_input_ordered: Dict[str, List[str]] = {}
-    for ip, inputs in ip_to_inputs.items():
-        # skip the special unresolved marker here; handle later
-        if ip.startswith("__UNRESOLVED__:"):
-            continue
-        # preserve the order of all_inputs_ordered when emitting joined names
-        ordered = [s for s in all_inputs_ordered if s in inputs]
-        if ordered:
-            ip_to_input_ordered[ip] = ordered
-        else:
-            # fallback - arbitrary order
-            ip_to_input_ordered[ip] = sorted(inputs)
+    CSV columns: Name,IP,Ports
 
+    - For each input FQDN (or single-IP "name"), collapse to ONE ROW:
+        * If any of its resolved IPs have open ports:
+              IP  = the open-IPs joined by ';'
+              Ports = union of open ports across those IPs (tcp/ prefix)
+        * Else:
+              IP  = all resolved IPs joined by ';' (or blank if none)
+              Ports = "None"
+    - For CIDR inputs (or any remaining scanned IPs not shown via a hostname row):
+        emit per-IP rows with that CIDR as Name.
+    - Unresolved input names (that never resolved and weren’t represented) get a row:
+        Name = input, IP = "", Ports = "None"
+    """
     rows = 0
-    # Collect set of IPs to write (merge ports_by_ip keys and any ip_to_input_ordered keys)
-    ips_set = set(ports_by_ip.keys()) | set(ip_to_input_ordered.keys())
+    emitted_ips: Set[str] = set()
+
+    def join_ips(ips: List[str]) -> str:
+        return ";".join(sort_ips_numerically(list(ips))) if ips else ""
 
     with open(output_path, "w", newline="") as csvf:
         w = csv.writer(csvf)
         w.writerow(["Name", "IP", "Ports"])
 
-        # First, emit rows for scanned IPs (sorted numerically)
-        for ip in sort_ips_numerically(list(ips_set)):
-            # Determine input name(s)
-            names_for_ip: List[str] = []
-            if ip in ip_to_input_ordered:
-                names_for_ip.extend(ip_to_input_ordered[ip])
-            # If no exact/resolved mapping, check CIDRs
-            if not names_for_ip:
-                cidr_matches = ips_in_cidr_mappings(ip, cidr_list)
-                # preserve original input order for CIDR matches
-                names_for_ip.extend([s for s in all_inputs_ordered if s in cidr_matches])
-            # If still none, we intentionally do NOT use reverse PTR as primary; keep blank
-            name_cell = ";".join(names_for_ip)
+        # 1) Emit one row per input "name" that has a mapping (FQDN or an IP literal treated as a name)
+        for name in all_inputs_ordered:
+            if name not in name_to_ips:
+                continue  # likely a CIDR or unresolved
+            resolved_ips = list(name_to_ips.get(name, set()))
+            if not resolved_ips:
+                # no resolved IPs; we'll show under unresolved later if needed
+                continue
 
-            ports_list = sorted(ports_by_ip.get(ip, set()), key=lambda p: int(p)) if ports_by_ip.get(ip) else []
-            if ports_list:
-                ports_cell = ",".join(f"tcp/{p}" for p in ports_list)
+            # Split into IPs with open ports vs without
+            open_ip_list = [ip for ip in resolved_ips if ports_by_ip.get(ip)]
+            if open_ip_list:
+                # Collapse to single row: IPs = the ones with open ports; Ports = union of their ports
+                union_ports: Set[str] = set()
+                for ip in open_ip_list:
+                    union_ports.update(ports_by_ip[ip])
+                ports_cell = ",".join(f"tcp/{p}" for p in sorted(union_ports, key=lambda p: int(p)))
+                ip_cell = join_ips(open_ip_list)
+                w.writerow([name, ip_cell, ports_cell])
+                rows += 1
+                emitted_ips.update(open_ip_list)
             else:
-                ports_cell = "None"
+                # None of the resolved IPs have open ports
+                ip_cell = join_ips(resolved_ips)
+                w.writerow([name, ip_cell, "None"])
+                rows += 1
+                # don't mark emitted_ips, these had no open ports
+
+        # 2) Emit per-IP rows for any remaining scanned IPs (e.g., from CIDRs)
+        #    Associate to the first matching CIDR (or join all matches if you prefer).
+        def cidr_name_for_ip(ip: str) -> str:
+            matches = [label for net, label in cidr_list if ipaddress.ip_address(ip) in net]
+            return matches[0] if matches else ""  # pick first match
+
+        for ip in sort_ips_numerically([ip for ip in ports_by_ip.keys() if ip not in emitted_ips]):
+            # skip if this IP was covered in a hostname row above
+            covered = False
+            for name, ips in name_to_ips.items():
+                if ip in ips:
+                    covered = True
+                    break
+            if covered:
+                continue
+
+            ports_list = sorted(ports_by_ip.get(ip, set()), key=lambda p: int(p))
+            if not ports_list:
+                # no open ports -> only show if you want to list every scanned IP; spec says we don't need to
+                continue
+
+            name_cell = cidr_name_for_ip(ip)
+            ports_cell = ",".join(f"tcp/{p}" for p in ports_list)
             w.writerow([name_cell, ip, ports_cell])
             rows += 1
 
-        # Then, emit any unresolved input names that had no mapped IPs (so you see them in output)
-        for key in sorted(ip_to_inputs.keys()):
-            if not key.startswith("__UNRESOLVED__:"):
-                continue
-            orig = key.split(":", 1)[1]
-            # ensure we don't duplicate an existing row for this input (e.g., input was resolved)
-            # check whether orig appears in any name_cell already; if not, emit a row
-            found = False
-            # cheap check: if orig was included in any ip_to_input_ordered values or cidr_list, skip
-            for inputs in ip_to_input_ordered.values():
-                if orig in inputs:
-                    found = True
-                    break
-            if not found:
-                # not resolved and not represented; emit a row with empty IP/Ports so you can see it
-                w.writerow([orig, "", ""])
+        # 3) Emit unresolved input names (never resolved and not represented above)
+        for name in all_inputs_ordered:
+            if name in name_to_ips:
+                continue  # already emitted above
+            if name in unresolved_names:
+                w.writerow([name, "", "None"])
                 rows += 1
 
     return rows
+
 
 # --- CLI -------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
@@ -311,7 +341,7 @@ def main() -> None:
         sys.exit(2)
 
     # Build mapping from input -> resolved IPs / CIDRs
-    ip_to_inputs_map, cidr_list = build_input_ip_map(all_inputs)
+    ip_to_inputs_map, cidr_list, name_to_ips, unresolved_names = build_input_ip_map(all_inputs)
 
     # Build and run nmap
     cmd = build_nmap_command(
@@ -331,7 +361,16 @@ def main() -> None:
         include_up_hosts_without_ports(nmap_stdout, ports_by_ip)
 
     # Write CSV: preferences: input mapping (exact/resolved) -> CIDR contains -> blank (no reverse PTR)
-    rows_written = write_csv(args.output, ports_by_ip, names_by_ip, ip_to_inputs_map, cidr_list, all_inputs)
+    rows_written = write_csv(
+    args.output,
+    ports_by_ip,
+    names_by_ip,
+    ip_to_inputs_map,
+    cidr_list,
+    all_inputs,
+    name_to_ips,
+    unresolved_names,
+    )
     print(f"Wrote {rows_written} rows to {args.output}", file=sys.stderr)
 
 if __name__ == "__main__":
