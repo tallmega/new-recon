@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-import argparse, csv, ipaddress, os, re, socket, subprocess, sys, time, uuid
+import argparse, csv, ipaddress, os, re, socket, subprocess, sys, time, uuid, ssl
 from collections import defaultdict
 from functools import lru_cache
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import dns.resolver
 
 DEFAULT_DNS_RESOLVERS=["1.1.1.1","1.0.0.1","8.8.8.8","8.8.4.4"]
@@ -29,6 +30,13 @@ try:
     _HAS_ALIVE=True
 except Exception:
     _HAS_ALIVE=False
+
+LIKELY_HTTP_PORTS={80,81,3000,5000,7001,7080,7081,7443,8000,8008,8080,8081,8088,
+                   8181,8443,8448,8880,8888,9000,9080,9090,9200,9443,10000,10443,
+                   11080,12000,12345,16080,18080,443,4443,4444,451,591,593,8320}
+TLS_LIKE_PORTS={443,4443,7443,8443,9443,10443,12443,16443,18091,18443}
+HTTP_CHECK_CACHE={}
+NUCLEI_CACHE={}
 
 def run_with_spinner(label, fn):
     if not _HAS_ALIVE:
@@ -162,6 +170,38 @@ def filter_wildcard_hosts(hosts,wildcard_ips):
             clean.add(h)
     return clean,removed
 
+def looks_like_http(ip,port,host_header=None,timeout=2.0):
+    key=(ip,port,host_header or "")
+    if key in HTTP_CHECK_CACHE:
+        return HTTP_CHECK_CACHE[key]
+    if port in LIKELY_HTTP_PORTS:
+        HTTP_CHECK_CACHE[key]=True
+        return True
+    host=host_header or ip
+    req=f"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: new-recon\r\nConnection: close\r\n\r\n"
+    data=b""
+    use_tls=port in TLS_LIKE_PORTS
+    try:
+        with socket.create_connection((ip,port),timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            if use_tls:
+                context=ssl.create_default_context()
+                context.check_hostname=False
+                context.verify_mode=ssl.CERT_NONE
+                with context.wrap_socket(sock,server_hostname=host if host_header else ip) as ssock:
+                    ssock.settimeout(timeout)
+                    ssock.sendall(req.encode('ascii','ignore'))
+                    data=ssock.recv(256)
+            else:
+                sock.sendall(req.encode('ascii','ignore'))
+                data=sock.recv(256)
+    except Exception:
+        HTTP_CHECK_CACHE[key]=False
+        return False
+    is_http=b"HTTP/" in data
+    HTTP_CHECK_CACHE[key]=is_http
+    return is_http
+
 # ---------- scanning ----------
 def scan_ports(ip,skip=False,nmap_top_ports=5000,nmap_timeout="90s"):
     if skip: return 'N/A'
@@ -191,16 +231,25 @@ def format_target(h,p):
     except: pass
     return f"{h}:{p}"
 
-def run_nuclei(host,port):
+def run_nuclei(host,port,host_header=None):
+    cache_key=(host,port,host_header or "")
+    if cache_key in NUCLEI_CACHE:
+        return NUCLEI_CACHE[cache_key]
     target=format_target(host,port)
     try:
-        proc=subprocess.Popen(
-            ["nuclei","-silent","-nc","-t","exposed-panels/","-t","technologies/","-u",target],
-            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    except FileNotFoundError: return ''
+        cmd=["nuclei","-silent","-nc",
+             "-t","exposed-panels/","-t","technologies/","-u",target]
+        if host_header:
+            cmd+=["-H",f"Host: {host_header}"]
+        proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        NUCLEI_CACHE[cache_key]=''
+        return ''
     out,_=proc.communicate()
     txt=out.decode(errors='ignore').strip()
-    if not txt: return ''
+    if not txt:
+        NUCLEI_CACHE[cache_key]=''
+        return ''
     # Filter nuclei output for meaningful tags
     tags=set()
     for line in txt.splitlines():
@@ -209,7 +258,9 @@ def run_nuclei(host,port):
             if any(x in tl for x in ['http','info','ssl','tcp','udp']): continue
             parts=tl.split(':')
             tags.add(parts[-1])
-    return ', '.join(sorted(tags))
+    result=', '.join(sorted(tags))
+    NUCLEI_CACHE[cache_key]=result
+    return result
 
 # ---------- csv ----------
 def write_csv(outfile,data):
@@ -286,7 +337,7 @@ def run_gobuster(domain,wordlist,resolvers=None,threads=50,force_wildcard=True):
 def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False,
                 nmap_top_ports=500,nmap_timeout="90s",nuclei_single_web_port=True,
                 resolvers=None,apply_wildcard_filter=True,gobuster_wordlist=None,
-                gobuster_threads=50,use_gobuster=True):
+                gobuster_threads=50,use_gobuster=True,nuclei_workers=1):
     print(f"[i] Enumerating {domain}")
     wildcard_ips=set()
     wildcard_hits=set()
@@ -335,28 +386,121 @@ def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False
         for r in recs: r['ports']=scanres[ip]
 
     if not skip:
-        print("[i] Running nuclei (smart single-port mode)" if nuclei_single_web_port else "[i] Running nuclei full mode")
+        if nuclei_single_web_port:
+            print("[i] Running nuclei in smart single-port mode (choose best HTTP port per IP)")
+        else:
+            print("[i] Running nuclei in full mode (every HTTP port per IP)")
+        nuclei_tasks=[]
+        seen_keys=set()
+        cache_hits=0
+        dedup_skips=0
+        non_http_skips=0
         for ip,recs in results.items():
             op=scanres[ip]
-            if not isinstance(op,set) or not op: continue
+            if not isinstance(op,set) or not op:
+                continue
+            port_set=set(op)
             chosen=None
             if nuclei_single_web_port:
                 for cand in [443,8443,80,8080]:
-                    if f"tcp/{cand}" in op: chosen=cand; break
+                    if f"tcp/{cand}" in port_set:
+                        chosen=cand
+                        break
                 if not chosen:
                     try:
-                        _,chosen=next(iter(sorted(op,key=proto_port_sort_key))).split('/')
+                        _,chosen=next(iter(sorted(port_set,key=proto_port_sort_key))).split('/')
                         chosen=int(chosen)
-                    except: continue
-                op={f"tcp/{chosen}"}
-            for pp in sorted(op,key=proto_port_sort_key):
+                    except Exception:
+                        continue
+                port_set={f"tcp/{chosen}"}
+            host_header=next((r['dns'] for r in recs if r['dns']), None)
+            for pp in sorted(port_set,key=proto_port_sort_key):
                 try:
                     _,portnum=pp.split('/')
                     portnum=int(portnum)
-                except: continue
-                out=run_nuclei(ip,portnum)
-                if out:
-                    for r in recs: r['nuclei']=out
+                except Exception:
+                    continue
+                key=(ip,portnum,host_header or "")
+                if key in seen_keys:
+                    dedup_skips+=1
+                    continue
+                seen_keys.add(key)
+                if key in NUCLEI_CACHE:
+                    cached=NUCLEI_CACHE[key]
+                    cache_hits+=1
+                    if cached:
+                        for r in recs:
+                            r['nuclei']=cached
+                    continue
+                if not looks_like_http(ip,portnum,host_header):
+                    non_http_skips+=1
+                    continue
+                nuclei_tasks.append((key,ip,portnum,host_header,recs))
+        if nuclei_tasks:
+            workers=max(1,nuclei_workers)
+            print(f"[i] Nuclei queued {len(nuclei_tasks)} targets "
+                  f"(cache hits {cache_hits}, non-http skipped {non_http_skips}, dedup {dedup_skips})")
+            if workers<=1:
+                if _HAS_ALIVE:
+                    with alive_bar(len(nuclei_tasks),title="nuclei scans") as bar:
+                        for key,ip,port,host_header,recs in nuclei_tasks:
+                            res=run_nuclei(ip,port,host_header)
+                            NUCLEI_CACHE[key]=res
+                            if res:
+                                for r in recs:
+                                    r['nuclei']=res
+                            bar()
+                else:
+                    for key,ip,port,host_header,recs in nuclei_tasks:
+                        print(f"[i] nuclei target {ip}:{port} (host {host_header or '-'})")
+                        res=run_nuclei(ip,port,host_header)
+                        NUCLEI_CACHE[key]=res
+                        if res:
+                            for r in recs:
+                                r['nuclei']=res
+            else:
+                print(f"[i] Running nuclei with {workers} worker threads")
+                progress_ctx=(alive_bar(len(nuclei_tasks),title="nuclei scans") if _HAS_ALIVE else None)
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_map={}
+                    for key,ip,port,host_header,recs in nuclei_tasks:
+                        future=executor.submit(run_nuclei,ip,port,host_header)
+                        future_map[future]=(key,recs)
+                    iterator=as_completed(future_map)
+                    if progress_ctx:
+                        with progress_ctx as bar:
+                            for fut in iterator:
+                                key,recs=future_map[fut]
+                                try:
+                                    res=fut.result()
+                                except Exception as exc:
+                                    print(f"[!] nuclei error on {key[0]}:{key[1]} - {exc}")
+                                    res=''
+                                NUCLEI_CACHE[key]=res
+                                if res:
+                                    for r in recs:
+                                        r['nuclei']=res
+                                bar()
+                    else:
+                        for fut in iterator:
+                            key,recs=future_map[fut]
+                            try:
+                                res=fut.result()
+                            except Exception as exc:
+                                print(f"[!] nuclei error on {key[0]}:{key[1]} - {exc}")
+                                res=''
+                            NUCLEI_CACHE[key]=res
+                            if res:
+                                for r in recs:
+                                    r['nuclei']=res
+        else:
+            total_candidates=cache_hits+non_http_skips+dedup_skips
+            if cache_hits:
+                print(f"[i] Nuclei reused cache for {cache_hits} targets; nothing new to scan")
+            elif total_candidates:
+                print(f"[i] No nuclei targets remaining (non-http skipped {non_http_skips}, dedup {dedup_skips})")
+            else:
+                print("[i] No HTTP-like services identified for nuclei")
     return results
 
 # ---------- main ----------
@@ -370,6 +514,8 @@ if __name__=="__main__":
     p.add_argument("--nmap-top-ports",type=int,default=5000)
     p.add_argument("--nmap-timeout",default="90s")
     p.add_argument("--nuclei-single-web-port",action="store_true",default=True)
+    p.add_argument("--nuclei-workers",type=int,default=4,
+                   help="Number of parallel nuclei workers to run (>=1)")
     p.add_argument("--dns-resolver",action="append",dest="dns_resolvers",
                    help="Custom DNS resolver IP (can be repeated)")
     p.add_argument("--use-system-resolvers",action="store_true",
@@ -405,7 +551,8 @@ if __name__=="__main__":
                       apply_wildcard_filter=not a.no_wildcard_filter,
                       gobuster_wordlist=a.gobuster_wordlist,
                       gobuster_threads=a.gobuster_threads,
-                      use_gobuster=not a.skip_gobuster)
+                      use_gobuster=not a.skip_gobuster,
+                      nuclei_workers=a.nuclei_workers)
         for ip,recs in r.items(): allres[ip].extend(recs)
     outfile=f"{a.domains[0]}_output.csv"
     write_csv(outfile,allres)

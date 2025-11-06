@@ -1,39 +1,13 @@
 #!/usr/bin/env python3
 """
-recon-ai-notes.py
+recon-ai-notes.py  (LLM per-host + one-hop follow + version parsing + local grouping)
 
-Purpose:
-  Post-process a CSV produced by new-recon.py to fill the Notes column by:
-    - Curling each hostname/IP once on a likely web port
-    - Sending curl output (+ optional Nuclei context) to an LLM
-    - Writing short (<=100 chars) notes per row, with a hybrid mode that can
-      collapse identical hosts into one combined summary
-      OR return per-host notes (deterministic JSON).
+Usage:
+  OPENAI_API_KEY=... python recon-ai-notes.py input.csv
+  OPENAI_API_KEY=... python recon-ai-notes.py input.csv -o output.csv
 
 CSV columns (from new-recon.py):
   DNS, IP / Hosting Provider, Ports, Nuclei, Notes
-
-Key behavior:
-  - Skips curl when Ports is "None" (case-insensitive) or has no known web ports.
-  - Known web ports: 443,80,8080,8443,8008,8000,8888,3000,5000
-  - DNS blank -> curl the IP parsed from "IP / Hosting Provider" (IPv4/IPv6).
-  - One curl per hostname (no per-row dedupe). If multiple hosts in a row:
-      * Hybrid JSON lets the LLM combine identical behavior into one sentence,
-        else returns per-host notes.
-  - Notes: <=100 chars; do NOT mention cert issuers/self-signed, HSTS, CSP, Google Analytics.
-  - Opens with utf-8-sig; normalizes header names.
-  - Overwrites the input CSV by default; use -o to write elsewhere.
-
-Usage:
-  python recon-ai-notes.py recon.csv
-  python recon-ai-notes.py recon.csv -o recon_with_notes.csv
-  OPENAI_API_KEY=... python recon-ai-notes.py recon.csv --model gpt-4.1
-
-Dependencies:
-  - curl on PATH
-  - Python 3.10+
-  - pip install openai>=1.50.0
-  - (optional) pip install alive-progress
 """
 
 import argparse
@@ -46,7 +20,7 @@ import sys
 import time
 from typing import List, Tuple, Dict, Optional
 
-# ---- Optional progress bar ----
+# ---------- Optional progress bar ----------
 _HAS_ALIVE = False
 try:
     from alive_progress import alive_it
@@ -54,49 +28,109 @@ try:
 except Exception:
     _HAS_ALIVE = False
 
-# ---- OpenAI client helper ----
+# ---------- OpenAI client ----------
 def get_openai_client():
     try:
         from openai import OpenAI
     except ImportError:
-        sys.stderr.write("[!] The 'openai' package is required. Install with: pip install openai>=1.50.0\n")
+        sys.stderr.write("[!] Install: pip install openai>=1.50.0\n")
         sys.exit(1)
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         sys.stderr.write("[!] Please set OPENAI_API_KEY in your environment.\n")
         sys.exit(1)
-    client = OpenAI(api_key=api_key)
-    return client
+    return OpenAI(api_key=api_key)
 
-# ---- Utility parsing ----
+# ---------- Constants / Regex ----------
 WEB_PORTS = [443, 80, 8080, 8443, 8008, 8000, 8888, 3000, 5000]
 PORT_PREFERENCE = [443, 80, 8080, 8443, 8008, 8000, 8888, 3000, 5000]
+
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 IPV6_RE = re.compile(r"\b([0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
+
+_HTTP_STATUS_RE = re.compile(r"^HTTP/\d\.\d\s+(\d{3})", re.MULTILINE)
+_LOCATION_RE    = re.compile(r"^Location:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
+
+# tech/version hints
+_PHP_RE         = re.compile(r"(?i)\bphp\b|x-powered-by:\s*php", re.IGNORECASE)
+_WP_RE          = re.compile(r"(?i)wordpress")
+_ASPNET_RE      = re.compile(r"(?i)asp\.net|x-aspnet", re.IGNORECASE)
+_CF_RE          = re.compile(r"(?i)cloudflare|cf-ray|cf-cache-status")
+_IDP_RE         = re.compile(r"(?i)microsoftonline\.com|login\.microsoftonline|login\.microsoft\.com|entra|okta|keycloak")
+
+SERVER_HDR_RE   = re.compile(r"^Server:\s*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
+X_POWERED_RE    = re.compile(r"^X-Powered-By:\s*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
+X_ASPNET_VER_RE = re.compile(r"^X-AspNet-Version:\s*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
+X_ASPNETMVC_VER_RE = re.compile(r"^X-AspNetMvc-Version:\s*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
+X_GENERATOR_RE  = re.compile(r"^X-Generator:\s*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
+META_WP_GEN_RE  = re.compile(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']WordPress\s*([0-9.]+)["\']', re.IGNORECASE)
+PHP_VER_IN_XPB  = re.compile(r"PHP/?\s*([0-9.]+)", re.IGNORECASE)
+IIS_VER_IN_SERVER = re.compile(r"Microsoft-IIS/([0-9.]+)", re.IGNORECASE)
+ASP_NET_IN_XPB  = re.compile(r"ASP\.NET(?:\s*([0-9.]+))?", re.IGNORECASE)
+
+HTTP_LABEL_MAP = {
+    "HTTP/2 200": "200 OK",
+    "HTTP/2 403": "403 Forbidden",
+    "HTTP/2 404": "404 Not Found",
+    "HTTP/2 429": "429 Too Many Requests",
+    "HTTP/2 500": "500 Internal Server Error",
+    "HTTP/2 502": "502 Bad Gateway",
+    "HTTP/2 503": "503 Service Unavailable",
+}
+
+TECH_TOKEN_RES = [
+    re.compile(r"\bWordPress\s*[0-9.]*", re.I),
+    re.compile(r"\bPHP\s*[0-9.]*", re.I),
+    re.compile(r"\bASP\.NET(?:\s*[0-9.]+)?", re.I),
+    re.compile(r"\bASP\.NET\s*MVC\s*[0-9.]+", re.I),
+    re.compile(r"\bMicrosoft-IIS/[0-9.]+", re.I),
+    re.compile(r"\bnginx\b", re.I),
+    re.compile(r"\bApache\b", re.I),
+    re.compile(r"\bCloudflare\b", re.I),
+    re.compile(r"\bIdP redirect\b", re.I),
+]
+
+# ---------- Helpers ----------
+def extract_tech_from_note(note: str) -> str:
+    """
+    Pull concise tech bits from a representative note (e.g., '200 OK, ASP.NET 4.0.30319, Microsoft-IIS/10.0')
+    and return a short 'ASP.NET 4.0.30319, Microsoft-IIS/10.0' string.
+    """
+    if not note:
+        return ""
+    # Remove leading status/redirect wording to reduce noise
+    note = re.sub(r"^\s*\d{3}(\s+\w+)?\s*,?\s*", "", note)            # drop '200 OK,' etc.
+    note = re.sub(r"^\s*3\d\d\s*->\s*\S+\s*,?\s*", "", note)          # drop '301 -> target,' etc.
+
+    found = []
+    seen = set()
+    for rx in TECH_TOKEN_RES:
+        for m in rx.finditer(note):
+            tok = m.group(0).strip().rstrip(",")
+            key = tok.lower()
+            if key not in seen:
+                seen.add(key)
+                found.append(tok)
+    return ", ".join(found)
 
 def parse_ports_cell(ports_cell: str):
     if ports_cell is None:
         return []
     s = ports_cell.strip()
     if s.lower() == "none":
-        return ["NONE"]  # sentinel
-    ports = []
+        return ["NONE"]
+    out = []
     for token in s.split(","):
         token = token.strip()
         m = re.search(r"tcp/(\d+)", token, re.IGNORECASE)
         if m:
             try:
-                ports.append(int(m.group(1)))
+                out.append(int(m.group(1)))
             except ValueError:
                 pass
-    return ports
+    return out
 
 def choose_scheme_and_port(ports) -> Optional[Tuple[str, int]]:
-    """
-    Return (scheme, port) or None if no web port should be used.
-    - If sentinel "NONE" present, return None.
-    - Only pick from WEB_PORTS; otherwise None.
-    """
     if "NONE" in ports:
         return None
     webset = [p for p in ports if isinstance(p, int) and p in WEB_PORTS]
@@ -107,27 +141,19 @@ def choose_scheme_and_port(ports) -> Optional[Tuple[str, int]]:
             return ("https", 443) if p == 443 else ("http", p)
     return None
 
-def split_hostnames(dns_cell: str, max_hosts:int) -> List[str]:
+def split_hosts(dns_cell: str, max_hosts:int) -> List[str]:
     if not dns_cell:
         return []
     raw = re.split(r"[,\s;]+", dns_cell.strip())
-    seen = set()
-    hosts = []
+    seen, out = set(), []
     for h in raw:
-        if not h:
-            continue
-        if h not in seen:
-            seen.add(h)
-            hosts.append(h)
-        if len(hosts) >= max_hosts:
-            break
-    return hosts
+        if h and h not in seen:
+            seen.add(h); out.append(h)
+            if len(out) >= max_hosts:
+                break
+    return out
 
 def extract_ip_from_provider_cell(cell: str) -> Optional[str]:
-    """
-    Pulls the first IPv4 or IPv6 from the 'IP / Hosting Provider' cell.
-    Returns None if no IP is present (e.g., 'Cloudflare', 'Azure').
-    """
     if not cell:
         return None
     m4 = IPV4_RE.search(cell)
@@ -138,12 +164,42 @@ def extract_ip_from_provider_cell(cell: str) -> Optional[str]:
         return m6.group(0)
     return None
 
-# ---- Curl execution ----
+def normalize_http_label(note: str) -> str:
+    if not note:
+        return note
+    for k, v in HTTP_LABEL_MAP.items():
+        if k in note:
+            note = note.replace(k, v)
+    note = re.sub(r"\s+,", ",", note)
+    note = re.sub(r",\s+,", ", ", note)
+    return note.strip()
+
+def safe_trunc(s: str, limit: int) -> str:
+    if len(s) <= limit:
+        return s
+    cut = max(s.rfind(" ", 0, limit), s.rfind(",", 0, limit), s.rfind(";", 0, limit), s.rfind(")", 0, limit))
+    if cut < int(limit * 0.6):
+        cut = limit
+    return s[:cut].rstrip() + "..."
+
+def abbreviate_hosts(hosts: List[str], maxlen: int) -> str:
+    if not hosts:
+        return ""
+    s = ", ".join(hosts)
+    if len(s) <= maxlen:
+        return s
+    if len(hosts) <= 2:
+        return (s[:maxlen-3] + "...")
+    return f"{hosts[0]}, {hosts[1]}, +{len(hosts)-2} more"
+
+# ---------- Curl ----------
 def run_curl(host_or_ip: str, scheme: str, port: int, timeout: int, user_agent: str, max_bytes: int) -> Dict[str, str]:
     url = f"{scheme}://{host_or_ip}"
     if (scheme == "http" and port != 80) or (scheme == "https" and port != 443):
         url = f"{scheme}://{host_or_ip}:{port}"
+    return run_curl_url(url, timeout, user_agent, max_bytes)
 
+def run_curl_url(url: str, timeout: int, user_agent: str, max_bytes: int) -> Dict[str, str]:
     cmd = [
         "curl",
         "-kvsS",
@@ -153,193 +209,256 @@ def run_curl(host_or_ip: str, scheme: str, port: int, timeout: int, user_agent: 
         "-A", user_agent,
         url,
     ]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", errors="replace")
     try:
-        stdout, stderr = proc.communicate(timeout=timeout + 5)
+        stdout, stderr = p.communicate(timeout=timeout + 5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        p.kill()
         return {"url": url, "stdout": "", "stderr": "[curl] Timeout", "rc": "124"}
-
     if len(stdout) > max_bytes:
         stdout = stdout[:max_bytes] + f"\n[...truncated to {max_bytes} bytes...]"
+    return {"url": url, "stdout": stdout, "stderr": stderr, "rc": str(p.returncode)}
 
-    return {"url": url, "stdout": stdout, "stderr": stderr, "rc": str(proc.returncode)}
+def parse_status_and_location(stdout: str) -> Tuple[Optional[str], Optional[str]]:
+    m_code = _HTTP_STATUS_RE.search(stdout or "")
+    code = m_code.group(1) if m_code else None
+    m_loc = _LOCATION_RE.search(stdout or "")
+    loc = m_loc.group(1).strip() if m_loc else None
+    return code, loc
 
-# ---- Local fallback heuristics (<=100 chars, no HSTS/CSP/GA or cert issuer) ----
-_HTTP_STATUS_RE = re.compile(r"^HTTP/\d\.\d\s+(\d{3})", re.MULTILINE)
-_LOCATION_RE    = re.compile(r"^Location:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
-_PHP_RE         = re.compile(r"(?i)\bphp\b|x-powered-by:\s*php", re.IGNORECASE)
-_WP_RE          = re.compile(r"(?i)wordpress")
-_ASPNET_RE      = re.compile(r"(?i)asp\.net|x-aspnet", re.IGNORECASE)
-_CF_RE          = re.compile(r"(?i)cloudflare|cf-ray|cf-cache-status")
-_ENTRA_RE       = re.compile(r"(?i)microsoftonline\.com|login\.microsoftonline|login\.microsoft\.com|entra", re.IGNORECASE)
-
-
-def _shorten(s: str, n: int = 100) -> str:
-    return s[:n]
-
+# ---------- Local fallback (version-aware) ----------
 def local_fallback_note(res: dict) -> str:
-    stdout = res.get("stdout") or ""
-    stderr = res.get("stderr") or ""
+    # Prefer the followed page if available
+    stdout = res.get("follow_stdout") or res.get("stdout") or ""
+    stderr = res.get("follow_stderr") or res.get("stderr") or ""
     blob = stdout + "\n" + stderr
 
-    m = _HTTP_STATUS_RE.search(stdout)
+    m = _HTTP_STATUS_RE.search(res.get("stdout") or "")
     code = m.group(1) if m else None
 
     loc = ""
-    lm = _LOCATION_RE.search(stdout)
+    lm = _LOCATION_RE.search(res.get("stdout") or "")
     if lm:
-        loc = lm.group(1)
-        loc = re.sub(r"^https?://", "", loc)  # shorter
+        loc = re.sub(r"^https?://", "", lm.group(1)).rstrip("/")
 
     parts = []
-    if code and loc:
-        parts.append(f"{code} -> {loc}")
+    if code and loc and code in ("301","302","307","308"):
+        host = loc.split("/", 1)[0]
+        path = "/" + loc.split("/",1)[1] if "/" in loc else ""
+        if path.count("/") > 2:
+            segs = path.strip("/").split("/")
+            path = "/" + "/".join(segs[:2]) + "/..."
+        parts.append(f"{code} -> {host}{path}")
     elif code:
-        parts.append(code)
+        label = {
+            "200":"200 OK",
+            "301":"301 Moved",
+            "302":"302 Found",
+            "307":"307 Redirect",
+            "308":"308 Redirect",
+            "403":"403 Forbidden",
+            "404":"404 Not Found",
+            "429":"429 Too Many Requests",
+            "500":"500 Internal Server Error",
+            "502":"502 Bad Gateway",
+            "503":"503 Service Unavailable",
+            "520":"520 Error",
+        }.get(code, code)
+        parts.append(label)
+    else:
+        if "Timeout" in (res.get("stderr") or ""):
+            parts.append("Timeout")
+        else:
+            parts.append("No response")
 
-    # framework/CMS clues (avoid HSTS/CSP/GA/cert chatter)
-    if _WP_RE.search(blob):
-        parts.append("WordPress")
-    elif _PHP_RE.search(blob):
-        parts.append("PHP")
-    elif _ASPNET_RE.search(blob):
-        parts.append("ASP.NET")
+    # Versions / stacks (from followed page when present)
+    server_val = ""
+    m_srv = SERVER_HDR_RE.search(stdout)
+    if m_srv:
+        server_val = m_srv.group(1).strip()
+        m_iis = IIS_VER_IN_SERVER.search(server_val)
+        if m_iis:
+            parts.append(f"Microsoft-IIS/{m_iis.group(1)}")
+        else:
+            if server_val.lower().startswith("nginx"):
+                parts.append("nginx")
+            elif server_val.lower().startswith("apache"):
+                parts.append("Apache")
 
-    if _ENTRA_RE.search(blob):
-        parts.append("IdP redirect")
+    m_xpb = X_POWERED_RE.search(stdout)
+    if m_xpb:
+        xpb = m_xpb.group(1)
+        m_php = PHP_VER_IN_XPB.search(xpb)
+        if m_php:
+            parts.append(f"PHP {m_php.group(1)}")
+        else:
+            m_asp = ASP_NET_IN_XPB.search(xpb)
+            if m_asp:
+                ver = m_asp.group(1)
+                parts.append(f"ASP.NET {ver}" if ver else "ASP.NET")
+
+    m_asv = X_ASPNET_VER_RE.search(stdout)
+    if m_asv:
+        parts.append(f"ASP.NET {m_asv.group(1).strip()}")
+
+    m_aspmvc = X_ASPNETMVC_VER_RE.search(stdout)
+    if m_aspmvc:
+        parts.append(f"ASP.NET MVC {m_aspmvc.group(1).strip()}")
+
+    wp_ver = ""
+    m_xgen = X_GENERATOR_RE.search(stdout)
+    if m_xgen and "WordPress" in m_xgen.group(1):
+        m_wpv = re.search(r"WordPress\s*([0-9.]+)", m_xgen.group(1), re.IGNORECASE)
+        if m_wpv:
+            wp_ver = m_wpv.group(1)
+    if not wp_ver:
+        m_meta = META_WP_GEN_RE.search(stdout)
+        if m_meta:
+            wp_ver = m_meta.group(1)
+    if wp_ver:
+        parts.append(f"WordPress {wp_ver}")
+    else:
+        if _WP_RE.search(stdout):
+            parts.append("WordPress")
+
     if _CF_RE.search(blob):
         parts.append("Cloudflare")
+    if _IDP_RE.search(blob):
+        parts.append("IdP redirect")
 
-    if not parts:
-        if "Timeout" in stderr:
-            parts.append("Timeout")
-        elif code:
-            parts.append(code)
-        else:
-            return ""  # nothing obvious
+    # De-dup
+    seen, uniq = set(), []
+    for p in parts:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return ", ".join(uniq)
 
-    return _shorten(" ".join(parts))
+# ---------- LLM (per-chunk strict per-host) ----------
+SIMPLE_PROMPT = """You are a terse web reconnaissance summarizer.
 
-# ---- LLM (Hybrid JSON mode + chunked per-host fallback) ----
-SYSTEM_PROMPT = """You are a terse web reconnaissance summarizer.
+Return ONLY this JSON:
+{"notes":["...", "...", ...], "sigs":["...", "...", ...]}
+with EXACTLY K strings in each array (in order). STRICT RULES:
 
-You will receive curl -kv results for K hostnames from one CSV row.
-Decide if they behave identically. Return ONLY valid JSON in one of two forms:
+- One note PER HOST. Never combine or summarize across hosts.
+- Do NOT include hostnames in the notes.
+- Do NOT write phrases like "Both hosts" or "All N hosts".
+- Keep each note concise. Include: HTTP status, redirect target (omit scheme),
+  clear errors (403/404/429/500/502/503/520), CDN/WAF (e.g., Cloudflare),
+  CMS/framework AND VERSIONS when present (e.g., WordPress 6.5.5, PHP 8.1.13,
+  ASP.NET 4.0.30319, Microsoft-IIS/10.0). Use response headers and meta tags:
+    - Server:
+    - X-Powered-By:
+    - X-AspNet-Version:
+    - X-AspNetMvc-Version:
+    - X-Generator:
+    - <meta name="generator" content="WordPress X.Y.Z">
+  Identify known enterprise platforms (/global-protect/ indicates PAN-OS VPN, CSCOE indicates Cisco VPN, OWA indicates Exchange, /sonicui/ indicates SonicWall, etc.).
+  Include IdP redirects (Microsoft/Entra, Okta, Keycloak) when evident.
+- Do NOT mention certificate issuers or self-signed, HSTS, CSP, or Google Analytics.
 
-COMBINED (all hosts behave the same):
-{"mode":"combined","summary":"..."}
-PER_HOST (hosts differ in behavior):
-{"mode":"per_host","notes":["...","..."]}
+"sigs" must be short grouping keys, e.g.:
+  "301->www.example.com|cf", "403|cf", "200|wp6.5|php8.1", "noresp", "timeout", "302->login.example.com|idp|cf"
 
-Rules:
-- In PER_HOST mode, DO NOT include hostnames in the notes; return note bodies only.
-- In COMBINED mode, you may say "Both hosts ..." or "All N hosts ...".
-- Keep each output string <=100 chars.
-- Prefer ":" to separate host and note if you include hostnames.
-- For redirects show status + target: "301 -> example.com/path" (omit scheme).
-- Include clear errors (403/404/429/500/502/503/520…), CDN/WAF (e.g., Cloudflare),
-  obvious frameworks/CMS (WordPress, PHP, ASP.NET), IdP redirects (Microsoft/Entra, Okta, Keycloak).
-- Do NOT mention: certificate issuers or self-signed, HSTS, CSP, Google Analytics.
-- For COMBINED, make a single compact human-readable sentence, e.g.:
-  "Both hosts 301 -> example.com/x/y (Cloudflare)" (or "All N hosts ..." if >2).
-- For PER_HOST, return exactly K strings in order, one per host. Be concise.
+Where tags may include:
+  |cf (Cloudflare), |idp (IdP redirect), |wp<ver>, |php<ver>, |asp<ver>, |iis<ver>
 
 Return JSON only, no extra text.
 """
 
-
-def build_user_prompt(host_results: List[Dict[str, str]], nuclei_hint: Optional[str] = None) -> str:
+def build_user_prompt(host_results: List[Dict[str, str]], nuclei_hint: Optional[str]) -> str:
     lines = [f"K={len(host_results)}"]
     if nuclei_hint:
         lines.append(f"NUCLEI: {nuclei_hint.strip()}")
-    lines.append("")  # spacer
+    lines.append("")
     for res in host_results:
-        part = [
-            f"HOST: {res['url']}",
-            f"RETURNCODE: {res['rc']}",
-        ]
+        part = [f"HOST: {res['url']}", f"RETURNCODE: {res['rc']}"]
         if res.get("stderr"):
             part.append("STDERR:\n" + res["stderr"].strip())
         if res.get("stdout"):
             part.append("STDOUT:\n" + res["stdout"].strip())
+        # include one-hop follow target
+        if res.get("follow_stdout") or res.get("follow_stderr"):
+            part.append("FOLLOW_ONE_STDOUT:\n" + (res.get("follow_stdout","").strip()))
+            if res.get("follow_stderr"):
+                part.append("FOLLOW_ONE_STDERR:\n" + res["follow_stderr"].strip())
         lines.append("\n".join(part))
     return "\n\n---\n\n".join(lines)
 
-def analyze_row_hybrid(client, model: str, host_results: List[Dict[str, str]], nuclei_hint: Optional[str],
-                       retries: int = 3, backoff: float = 1.6) -> Dict:
-    """
-    Returns a dict either:
-      {"mode":"combined","summary":"..."}  OR
-      {"mode":"per_host","notes":[str, ...]}  (len == K)
-    On failure, returns empty dict -> caller should fallback locally.
-    """
-    prompt = build_user_prompt(host_results, nuclei_hint)
-    for attempt in range(retries):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                max_tokens=350,
-            )
-            txt = resp.choices[0].message.content.strip()
-            obj = json.loads(txt)
-            mode = obj.get("mode", "")
-            if mode == "combined" and isinstance(obj.get("summary", ""), str):
-                return {"mode": "combined", "summary": obj["summary"][:100]}
-            if mode == "per_host" and isinstance(obj.get("notes"), list):
-                notes = [(n or "")[:100] if isinstance(n, str) else "" for n in obj["notes"]]
-                if len(notes) == len(host_results):
-                    return {"mode": "per_host", "notes": notes}
-        except Exception:
-            time.sleep(backoff ** attempt)
-    return {}
-
 def analyze_chunk_with_openai(client, model: str, host_results: List[Dict[str, str]],
                               nuclei_hint: Optional[str], retries: int = 3,
-                              backoff: float = 1.6) -> List[str]:
-    """
-    Deterministic per-chunk analyzer that returns a list of strings (one per host).
-    Uses a simpler JSON contract: {"notes":["...", "..."]} with EXACT length K.
-    """
-    simple_prompt = """You are a terse web reconnaissance summarizer.
-Return ONLY this JSON: {"notes":["...", "...", ...]} with EXACTLY K strings (in order).
-Each note <=100 chars. Include HTTP status/redirects, clear errors, CDN/WAF, CMS/framework,
-IdP redirects. Do NOT mention cert issuers/self-signed, HSTS, CSP, Google Analytics."""
+                              backoff: float = 1.6) -> Tuple[List[str], List[str]]:
     user_prompt = build_user_prompt(host_results, nuclei_hint)
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": simple_prompt},
+                    {"role": "system", "content": SIMPLE_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.0,
-                max_tokens=350,
+                max_tokens=500,
             )
             txt = resp.choices[0].message.content.strip()
             obj = json.loads(txt)
             notes = obj.get("notes", [])
-            if isinstance(notes, list) and len(notes) == len(host_results):
-                return [(n or "")[:100] if isinstance(n, str) else "" for n in notes]
+            sigs  = obj.get("sigs", [])
+            if (isinstance(notes, list) and isinstance(sigs, list)
+                and len(notes) == len(host_results) and len(sigs) == len(host_results)):
+                notes = [(n or "") if isinstance(n, str) else "" for n in notes]
+                sigs  = [(s or "").strip() if isinstance(s, str) else "" for s in sigs]
+                return notes, sigs
         except Exception:
             time.sleep(backoff ** attempt)
-    return [""] * len(host_results)
+    return [""] * len(host_results), [""] * len(host_results)
 
-# ---- CSV helpers ----
+# ---------- Grouping across whole row ----------
+def group_and_format(hosts: List[str], notes_all: List[str], sigs_all: List[str], frag_limit: int) -> str:
+    """
+    Combine hosts with identical 'sig' into concise fragments.
+    - Redirect sigs "30x->target" become: "h1, h2 -> target (tech...)" when tech present
+    - Non-redirect groups: "h1, h2: <note>"
+    Each fragment is truncated to frag_limit chars; fragments joined with " ; ".
+    """
+    groups: Dict[str, List[int]] = {}
+    for i, sig in enumerate(sigs_all):
+        groups.setdefault(sig or "__nosig__", []).append(i)
+
+    frags = []
+    for sig, idxs in groups.items():
+        group_hosts = [hosts[i] for i in idxs]
+
+        # choose first non-empty note; else fallback
+        rep_note = ""
+        for i in idxs:
+            if notes_all[i]:
+                rep_note = notes_all[i]
+                break
+        if not rep_note:
+            rep_note = "No response"
+        rep_note = normalize_http_label(rep_note)
+
+        m = re.match(r"3\d\d->([^|]+)", sig) if sig else None
+        if m:
+            target_host = m.group(1)
+            hostlist = abbreviate_hosts(group_hosts, maxlen=60)
+            tech = extract_tech_from_note(rep_note)
+            if tech:
+                frag = f"{hostlist} -> {target_host} ({tech})"
+            else:
+                frag = f"{hostlist} -> {target_host}"
+        else:
+            hostlist = abbreviate_hosts(group_hosts, maxlen=60)
+            frag = f"{hostlist}: {rep_note}"
+
+        frags.append(safe_trunc(frag, frag_limit))
+
+    return " ; ".join(frags)
+
+# ---------- CSV ----------
 BASE_COLS = ["DNS", "IP / Hosting Provider", "Ports", "Nuclei"]
 NOTES_COL = "Notes"
 
@@ -352,9 +471,10 @@ def ensure_required_fields(fieldnames):
         sys.stderr.write(f"[!] Missing required column(s): {', '.join(missing)}\n")
         sys.exit(1)
 
-# ---- Main processing ----
+# ---------- Main processing ----------
 def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: int, timeout: int,
-                ua: str, max_bytes: int, model: str, show_headers: bool):
+                ua: str, max_bytes: int, model: str, show_headers: bool, frag_limit: int,
+                chunk_size: int, follow_one: bool):
     client = get_openai_client()
 
     with open(input_path, newline="", encoding="utf-8-sig") as f:
@@ -363,14 +483,12 @@ def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: 
         if show_headers:
             print("Detected headers:", fieldnames)
         reader.fieldnames = fieldnames
-
         ensure_required_fields(fieldnames)
         if NOTES_COL not in fieldnames:
             fieldnames.append(NOTES_COL)
-
         rows = list(reader)
 
-    iter_rows = alive_it(rows, title="Probing & analyzing hosts") if _HAS_ALIVE else rows
+    iter_rows = alive_it(rows, title="Curling & LLM grouping") if _HAS_ALIVE else rows
     total = len(rows)
     out_rows = []
 
@@ -380,106 +498,108 @@ def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: 
         ports_cell = row.get("Ports", "")
         nuclei_hint = (row.get("Nuclei") or "").strip()
 
-        # Parse ports and decide if we should skip entirely
         ports = parse_ports_cell(ports_cell)
         choice = choose_scheme_and_port(ports)
         if choice is None:
-            # Skip: Ports was "None" or no web ports present; leave Notes unchanged
             out_rows.append(row)
-            if _HAS_ALIVE:
-                iter_rows.text = f"{idx+1}/{total} skip (non-web)"
+            if _HAS_ALIVE: iter_rows.text = f"{idx+1}/{total} skip (non-web)"
             continue
-
         scheme, port = choice
 
-        # Resolve target list
-        hostnames = split_hostnames(dns_cell, max_hosts_per_row)
+        hostnames = split_hosts(dns_cell, max_hosts_per_row)
         if not hostnames:
             ip = extract_ip_from_provider_cell(provider_cell)
             if not ip:
-                # Still nothing to hit; leave Notes unchanged
                 out_rows.append(row)
-                if _HAS_ALIVE:
-                    iter_rows.text = f"{idx+1}/{total} skip (no DNS/IP)"
+                if _HAS_ALIVE: iter_rows.text = f"{idx+1}/{total} skip (no DNS/IP)"
                 continue
             hostnames = [ip]
 
         if _HAS_ALIVE:
             iter_rows.text = f"{idx+1}/{total} {hostnames[0][:50]}"
 
-        # Probe each hostname once
         host_results = []
         for hostname in hostnames:
-            if _HAS_ALIVE:
-                iter_rows.text = f"{idx+1}/{total} curl {hostname}:{port}"
-            res = run_curl(
-                host_or_ip=hostname,
-                scheme=scheme,
-                port=port,
-                timeout=timeout,
-                user_agent=ua,
-                max_bytes=max_bytes,
-            )
+            if _HAS_ALIVE: iter_rows.text = f"{idx+1}/{total} curl {hostname}:{port}"
+            res = run_curl(hostname, scheme, port, timeout, ua, max_bytes)
+
+            # one-hop follow after 30x to capture tech/meta on destination
+            code, loc = parse_status_and_location(res.get("stdout",""))
+            if follow_one and code in ("301","302","307","308") and loc:
+                if loc.lower().startswith(("http://", "https://")):
+                    follow_url = loc
+                else:
+                    base = f"{scheme}://{hostname}"
+                    if (scheme == "http" and port != 80) or (scheme == "https" and port != 443):
+                        base = f"{scheme}://{hostname}:{port}"
+                    if loc.startswith("//"):
+                        follow_url = f"{scheme}:{loc}"
+                    elif loc.startswith("/"):
+                        follow_url = base + loc
+                    else:
+                        follow_url = base.rstrip("/") + "/" + loc
+                follow_res = run_curl_url(follow_url, timeout, ua, max_bytes)
+                res["follow_stdout"] = follow_res.get("stdout","")
+                res["follow_stderr"] = follow_res.get("stderr","")
+
             host_results.append(res)
 
-        # Analyze: hybrid for small rows (<=3 hosts), else chunked per-host
+        # LLM per-chunk (strict per-host), then group across the row
         notes_all: List[str] = []
-        if len(host_results) <= 3:
-            obj = analyze_row_hybrid(client, model, host_results, nuclei_hint)
-            if obj.get("mode") == "combined":
-                # Use the single combined summary as Notes
-                row[NOTES_COL] = obj["summary"]
-                out_rows.append(row)
-                continue
-            elif obj.get("mode") == "per_host":
-                notes_all = obj["notes"]
-            else:
-                # Hybrid failed -> local fallback per host
-                notes_all = [local_fallback_note(hr) or "No response" for hr in host_results]
-        else:
-            # Chunked per-host deterministic path (no combining across chunks)
-            CHUNK_SIZE = 2
-            for i in range(0, len(host_results), CHUNK_SIZE):
-                chunk = host_results[i:i+CHUNK_SIZE]
-                notes = analyze_chunk_with_openai(client, model, chunk, nuclei_hint)
-                # local fallback for blanks
-                for j, n in enumerate(notes):
-                    if not n:
-                        notes[j] = local_fallback_note(chunk[j]) or "No response"
-                notes_all.extend(notes)
+        sigs_all:  List[str] = []
 
-        # If multiple hosts in the row, label each note with hostname using ":"
-        if len(hostnames) > 1:
-            labeled = [f"{hn}: {note}" for hn, note in zip(hostnames, notes_all)]
-            combined_notes = " ; ".join(labeled)
-        else:
-            combined_notes = notes_all[0] if notes_all else "No response"
+        for i in range(0, len(host_results), chunk_size):
+            chunk = host_results[i:i+chunk_size]
+            notes, sigs = analyze_chunk_with_openai(client, model, chunk, nuclei_hint)
 
-        row[NOTES_COL] = combined_notes
+            # Fill blanks with local fallback & minimal sig
+            for j in range(len(chunk)):
+                if not notes[j]:
+                    notes[j] = local_fallback_note(chunk[j]) or "No response"
+                if not sigs[j]:
+                    stdout = chunk[j].get("stdout", "")
+                    mcode = re.search(r"^HTTP/\d\.\d\s+(\d{3})", stdout, re.M)
+                    code = mcode.group(1) if mcode else "noresp"
+                    if code in ("301","302","307","308"):
+                        mloc = re.search(r"^Location:\s*(\S+)", stdout, re.I|re.M)
+                        tgt = re.sub(r"^https?://", "", mloc.group(1)).split("/",1)[0] if mloc else ""
+                        sigs[j] = f"3xx->{tgt}" if tgt else "3xx"
+                    else:
+                        sigs[j] = code
+
+            notes = [normalize_http_label(n) for n in notes]
+            notes_all.extend(notes)
+            sigs_all.extend(sigs)
+
+        combined = group_and_format(hostnames, notes_all, sigs_all, frag_limit=frag_limit)
+        row["Notes"] = combined
         out_rows.append(row)
 
-    # Write output (in-place by default)
     write_path = output_path or input_path
-    with open(write_path, "w", newline="", encoding="utf-8") as f:
+    with open(write_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(out_rows)
-
     print(f"[+] Wrote: {write_path}")
 
-# ---- CLI ----
+# ---------- CLI ----------
 def main():
     parser = argparse.ArgumentParser(
-        description="Fill the Notes column of a CSV generated by new-recon.py using curl + LLM hybrid analysis."
+        description="Fill the Notes column (from new-recon.py CSV) using curl + LLM per-host analysis with one-hop follow and local grouping."
     )
-    parser.add_argument("input_csv", help="Path to CSV from new-recon.py (columns: DNS, IP / Hosting Provider, Ports, Nuclei, Notes)")
-    parser.add_argument("-o", "--output-csv", help="Optional output CSV path. If omitted, the input file is overwritten in place.")
-    parser.add_argument("--max-hosts-per-row", type=int, default=3, help="Max hostnames to probe per row (parsed from DNS cell). Default: 3")
-    parser.add_argument("--timeout", type=int, default=15, help="Curl timeout seconds per request. Default: 15")
-    parser.add_argument("--user-agent", default="Mozilla/5.0 (compatible; ReconBot/1.0)", help="User-Agent for curl")
-    parser.add_argument("--max-bytes", type=int, default=2048, help="Truncate stdout to this many bytes. Default: 2048")
-    parser.add_argument("--model", default="gpt-4.1", help="OpenAI model to use (e.g., gpt-4.1, gpt-4o)")
-    parser.add_argument("--show-headers", action="store_true", help="Print detected CSV header names and continue")
+    parser.add_argument("input_csv", help="CSV from new-recon.py (columns: DNS, IP / Hosting Provider, Ports, Nuclei, Notes)")
+    parser.add_argument("-o", "--output-csv", help="Optional output CSV path. If omitted, overwrite input CSV.")
+    parser.add_argument("--max-hosts-per-row", type=int, default=60, help="Max hostnames to parse from DNS cell (default 60)")
+    parser.add_argument("--timeout", type=int, default=15, help="curl timeout seconds (default 15)")
+    parser.add_argument("--user-agent", default="Mozilla/5.0 (compatible; ReconBot/1.0)", help="curl User-Agent")
+    parser.add_argument("--max-bytes", type=int, default=4096, help="Truncate curl stdout to this many bytes (default 4096)")
+    parser.add_argument("--model", default="gpt-4.1", help="OpenAI model (e.g., gpt-4.1, gpt-4o)")
+    parser.add_argument("--show-headers", action="store_true", help="Print detected CSV header names")
+    parser.add_argument("--max-fragment-len", type=int, default=140, help="Max characters per Notes fragment (default 140)")
+    parser.add_argument("--chunk-size", type=int, default=3, help="Hosts per LLM prompt chunk (default 3)")
+    # follow-one enabled by default; provide opt-out switch
+    parser.add_argument("--no-follow-one", dest="follow_one", action="store_false", help="Disable one-hop follow after 30x")
+    parser.set_defaults(follow_one=True)
     args = parser.parse_args()
 
     process_csv(
@@ -491,6 +611,9 @@ def main():
         max_bytes=args.max_bytes,
         model=args.model,
         show_headers=args.show_headers,
+        frag_limit=args.max_fragment_len,
+        chunk_size=args.chunk_size,
+        follow_one=args.follow_one,
     )
 
 if __name__ == "__main__":
