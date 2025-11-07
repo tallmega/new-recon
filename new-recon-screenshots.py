@@ -391,7 +391,8 @@ def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Target]],mapp
         new_row={
             "DNS":row.get("DNS",""),
             "IP / Hosting Provider":row.get("IP / Hosting Provider",""),
-            "Ports":row.get("Ports","")
+            "Ports":row.get("Ports",""),
+            "notes_text":row.get("Notes","") or ""
         }
         fragments=[]
         target_entries=[]
@@ -455,23 +456,30 @@ def write_html_output(rows:List[Dict[str,str]],path:str) -> None:
             ".shot-pending{font-style:italic;color:#666;}"
             ".col-ip{width:20%;}"
             ".col-port{width:10%;}"
+            ".note-text{margin-bottom:10px;font-style:italic;text-align:left;}"
             "</style>\n"
         )
         f.write("</head>\n<body>\n")
-        f.write("<table>\n<thead><tr><th>FQDN</th><th class=\"col-ip\">IP / Hosting Provider</th><th class=\"col-port\">Ports</th><th>Screenshots</th></tr></thead>\n<tbody>\n")
+        f.write("<table>\n<thead><tr><th>FQDN</th><th class=\"col-ip\">First Resolved IP</th><th class=\"col-port\">Ports</th><th>Notes and Screenshots</th></tr></thead>\n<tbody>\n")
         for row in rows:
             dns=html.escape(row.get("DNS",""))
-            ip=html.escape(row.get("IP / Hosting Provider",""))
+            resolved_ip=extract_ip(row.get("IP / Hosting Provider","")) or row.get("IP / Hosting Provider","")
+            ip=html.escape(resolved_ip)
             ports=html.escape(row.get("Ports",""))
+            note_text=html.escape(row.get("notes_text","").strip())
             f.write("<tr>")
             f.write(f"<td>{dns}</td><td class=\"col-ip\">{ip}</td><td class=\"col-port\">{ports}</td>")
             shots=row.get("_targets") or []
             if not shots:
-                f.write("<td></td>")
+                if note_text:
+                    f.write(f"<td><div class=\"note-text\">{note_text}</div></td>")
+                else:
+                    f.write("<td></td>")
             else:
                 f.write("<td>")
+                if note_text:
+                    f.write(f"<div class=\"note-text\">{note_text}</div>")
                 for entry in shots:
-                    label_text=html.escape(entry.get("label","") or "")
                     if entry.get("pending"):
                         f.write("<div class=\"shot-block\"></div>")
                         continue
@@ -481,9 +489,7 @@ def write_html_output(rows:List[Dict[str,str]],path:str) -> None:
                     rel=os.path.relpath(thumb_path,base)
                     rel_html=html.escape(rel)
                     f.write("<div class=\"shot-block\">")
-                    if label_text:
-                        f.write(f"<div>{label_text}</div>")
-                    f.write(f"<img src=\"{rel_html}\" alt=\"{label_text}\">")
+                    f.write(f"<img src=\"{rel_html}\" alt=\"{dns}\">")
                     f.write("</div>")
                 f.write("</td>")
             f.write("</tr>\n")
