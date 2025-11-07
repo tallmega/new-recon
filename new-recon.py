@@ -344,16 +344,10 @@ def run_gobuster(domain,wordlist,resolvers=None,threads=50,force_wildcard=True):
         if host: hosts.add(host)
     return hosts
 
-# ---------- domain scan ----------
-def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False,
-                nmap_top_ports=500,nmap_timeout="90s",nuclei_single_web_port=True,
-                resolvers=None,apply_wildcard_filter=True,gobuster_wordlist=None,
-                gobuster_threads=50,use_gobuster=True,nuclei_workers=1,nmap_workers=4,
-                exclude_ips=None,input_ip_tracker=None,nmap_cache=None,nuclei_seen=None):
-    exclude_ips=exclude_ips or set()
-    input_ip_tracker=input_ip_tracker if input_ip_tracker is not None else set()
-    nmap_cache=nmap_cache if nmap_cache is not None else {}
-    nuclei_seen=nuclei_seen if nuclei_seen is not None else set()
+# ---------- domain enumeration ----------
+def enumerate_domain(domain,input_ips,scan_all=False,prefer_input_ip=False,
+                     resolvers=None,apply_wildcard_filter=True,gobuster_wordlist=None,
+                     gobuster_threads=50,use_gobuster=True):
     print(f"[i] Enumerating {domain}")
     wildcard_ips=set()
     wildcard_hits=set()
@@ -389,38 +383,38 @@ def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False
         print(f"[i] Filtered {len(wildcard_hits)} total wildcard hostnames")
 
     results=defaultdict(list)
-    explicit_ips={str(ip) for ip in input_ips if is_ip(ip)}
-    exclude_ips={ip for ip in excludes if is_ip(ip)}
-    if exclude_ips:
-        print(f"[i] Excluding {len(exclude_ips)} IPs from scans")
-        for ip in sorted(exclude_ips,key=ip_sort_key):
-            print(f"    - {ip}")
     for s in sorted(subs):
         ips=choose_ips_for_fqdn(s,scan_all,input_ips,prefer_input_ip)
         for ip in ips:
             ip_str=str(ip)
-            rec={'dns':s,'ports':set(),'nuclei':'','excluded':False}
-            if ip_str in exclude_ips:
-                rec['ports']='Excluded'
-                rec['excluded']=True
-        results[ip_str].append(rec)
-    for raw_ip in explicit_ips:
-        ip_key=str(raw_ip)
-        recs=results.setdefault(ip_key,[])
-        if not recs:
-            recs.append({'dns':'','ports':('Excluded' if ip_key in exclude_ips else set()),'nuclei':'','excluded':ip_key in exclude_ips})
+            results[ip_str].append({'dns':s,'ports':set(),'nuclei':'','excluded':False})
+    return results
 
-    # nmap
+def merge_results(dest,src):
+    for ip,recs in src.items():
+        dest[ip].extend(recs)
+
+def ensure_input_ips(results,explicit_ips,exclude_ips):
+    for ip in explicit_ips:
+        recs=results.setdefault(ip,[])
+        if not recs:
+            recs.append({'dns':'','ports':set(),'nuclei':'','excluded':ip in exclude_ips})
+
+def run_scans(results,skip,explicit_ips,exclude_ips,
+              nmap_top_ports=500,nmap_timeout="90s",nuclei_single_web_port=True,
+              nuclei_workers=1,nmap_workers=4):
+    target_ips=[ip for ip in results if ip not in exclude_ips]
     nmap_extra=[]
     scanres={}
-    if not skip:
-        total_targets=len(results)
-        if len(results)>1:
+    if skip or not target_ips:
+        for ip in target_ips: scanres[ip]='N/A'
+    else:
+        total_targets=len(target_ips)
+        if total_targets>1:
             print(f"[i] Scanning {total_targets} IPs with nmap (parallel)")
-            iterator_results=[]
             with ThreadPoolExecutor(max_workers=nmap_workers) as executor:
-                future_map={executor.submit(scan_ports,ip,skip,nmap_top_ports,nmap_timeout,nmap_extra):ip
-                            for ip in results}
+                future_map={executor.submit(scan_ports,ip,False,nmap_top_ports,nmap_timeout,nmap_extra):ip
+                            for ip in target_ips}
                 completed=as_completed(future_map)
                 if _HAS_ALIVE:
                     with alive_bar(total_targets,title="nmap scans") as bar:
@@ -442,25 +436,14 @@ def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False
                             print(f"[!] nmap error for {ip}: {exc}")
                             scanres[ip]='N/A'
         else:
-            for ip in results:
-                if _HAS_ALIVE:
-                    with alive_bar(1,title="nmap scans") as bar:
-                        scanres[ip]=scan_ports(ip,skip,nmap_top_ports,nmap_timeout,nmap_extra)
-                        bar()
-                else:
-                    print(f"[i] nmap target {ip}")
-                    scanres[ip]=scan_ports(ip,skip,nmap_top_ports,nmap_timeout,nmap_extra)
-    else:
-        for ip in results: scanres[ip]='N/A'
+            ip=target_ips[0]
+            print(f"[i] nmap target {ip}")
+            scanres[ip]=scan_ports(ip,False,nmap_top_ports,nmap_timeout,nmap_extra)
 
-    if not skip:
-        if exclude_ips:
-            for ip in exclude_ips:
-                scanres[ip]='Excluded'
-        for ip in explicit_ips:
-            if ip in results and scanres.get(ip,'N/A')=='N/A':
-                print(f"[i] nmap returned no data for {ip}; treating as no open ports")
-                scanres[ip]=set()
+    for ip in explicit_ips:
+        if ip in results and ip not in exclude_ips and scanres.get(ip,'N/A')=='N/A':
+            print(f"[i] nmap returned no data for {ip}; treating as no open ports")
+            scanres[ip]=set()
 
     for ip,recs in results.items():
         if ip in exclude_ips:
@@ -470,105 +453,94 @@ def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False
         for r in recs:
             r['ports']=ports_val
 
-    if not skip:
+    if skip:
+        return
+
+    if nuclei_single_web_port:
+        print("[i] Running nuclei in smart single-port mode (choose best HTTP port per IP)")
+    else:
+        print("[i] Running nuclei in full mode (every HTTP port per IP)")
+    nuclei_tasks=[]
+    seen_keys=set()
+    cache_hits=0
+    dedup_skips=0
+    non_http_skips=0
+    for ip,recs in results.items():
+        if ip in exclude_ips:
+            continue
+        op=scanres.get(ip)
+        if not isinstance(op,set) or not op:
+            continue
+        port_set=set(op)
+        chosen=None
         if nuclei_single_web_port:
-            print("[i] Running nuclei in smart single-port mode (choose best HTTP port per IP)")
-        else:
-            print("[i] Running nuclei in full mode (every HTTP port per IP)")
-        nuclei_tasks=[]
-        seen_keys=set()
-        cache_hits=0
-        dedup_skips=0
-        non_http_skips=0
-        for ip,recs in results.items():
-            if ip in exclude_ips:
-                continue
-            op=scanres[ip]
-            if not isinstance(op,set) or not op:
-                continue
-            port_set=set(op)
-            chosen=None
-            if nuclei_single_web_port:
-                for cand in [443,8443,80,8080]:
-                    if f"tcp/{cand}" in port_set:
-                        chosen=cand
-                        break
-                if not chosen:
-                    try:
-                        _,chosen=next(iter(sorted(port_set,key=proto_port_sort_key))).split('/')
-                        chosen=int(chosen)
-                    except Exception:
-                        continue
-                port_set={f"tcp/{chosen}"}
-            host_header=next((r['dns'] for r in recs if r['dns']), None)
-            for pp in sorted(port_set,key=proto_port_sort_key):
+            for cand in [443,8443,80,8080]:
+                if f"tcp/{cand}" in port_set:
+                    chosen=cand
+                    break
+            if not chosen:
                 try:
-                    _,portnum=pp.split('/')
-                    portnum=int(portnum)
+                    _,chosen=next(iter(sorted(port_set,key=proto_port_sort_key))).split('/')
+                    chosen=int(chosen)
                 except Exception:
                     continue
-                key=(ip,portnum,host_header or "")
-                if key in seen_keys:
-                    dedup_skips+=1
-                    continue
-                seen_keys.add(key)
-                if key in NUCLEI_CACHE:
-                    cached=NUCLEI_CACHE[key]
-                    cache_hits+=1
-                    if cached:
-                        for r in recs:
-                            r['nuclei']=cached
-                    continue
-                if not looks_like_http(ip,portnum,host_header):
-                    non_http_skips+=1
-                    continue
-                nuclei_tasks.append((key,ip,portnum,host_header,recs))
-        if nuclei_tasks:
-            workers=max(1,nuclei_workers)
-            print(f"[i] Nuclei queued {len(nuclei_tasks)} targets "
-                  f"(cache hits {cache_hits}, non-http skipped {non_http_skips}, dedup {dedup_skips})")
-            if workers<=1:
-                if _HAS_ALIVE:
-                    with alive_bar(len(nuclei_tasks),title="nuclei scans") as bar:
-                        for key,ip,port,host_header,recs in nuclei_tasks:
-                            res=run_nuclei(ip,port,host_header)
-                            NUCLEI_CACHE[key]=res
-                            if res:
-                                for r in recs:
-                                    r['nuclei']=res
-                            bar()
-                else:
+            port_set={f"tcp/{chosen}"}
+        host_header=next((r['dns'] for r in recs if r['dns']), None)
+        for pp in sorted(port_set,key=proto_port_sort_key):
+            try:
+                _,portnum=pp.split('/')
+                portnum=int(portnum)
+            except Exception:
+                continue
+            key=(ip,portnum,host_header or "")
+            if key in seen_keys:
+                dedup_skips+=1
+                continue
+            seen_keys.add(key)
+            if key in NUCLEI_CACHE:
+                cached=NUCLEI_CACHE[key]
+                cache_hits+=1
+                if cached:
+                    for r in recs:
+                        r['nuclei']=cached
+                continue
+            if not looks_like_http(ip,portnum,host_header):
+                non_http_skips+=1
+                continue
+            nuclei_tasks.append((key,ip,portnum,host_header,recs))
+    if nuclei_tasks:
+        workers=max(1,nuclei_workers)
+        print(f"[i] Nuclei queued {len(nuclei_tasks)} targets "
+              f"(cache hits {cache_hits}, non-http skipped {non_http_skips}, dedup {dedup_skips})")
+        if workers<=1:
+            if _HAS_ALIVE:
+                with alive_bar(len(nuclei_tasks),title="nuclei scans") as bar:
                     for key,ip,port,host_header,recs in nuclei_tasks:
-                        print(f"[i] nuclei target {ip}:{port} (host {host_header or '-'})")
                         res=run_nuclei(ip,port,host_header)
                         NUCLEI_CACHE[key]=res
                         if res:
                             for r in recs:
                                 r['nuclei']=res
+                        bar()
             else:
-                print(f"[i] Running nuclei with {workers} worker threads")
-                progress_ctx=(alive_bar(len(nuclei_tasks),title="nuclei scans") if _HAS_ALIVE else None)
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    future_map={}
-                    for key,ip,port,host_header,recs in nuclei_tasks:
-                        future=executor.submit(run_nuclei,ip,port,host_header)
-                        future_map[future]=(key,recs)
-                    iterator=as_completed(future_map)
-                    if progress_ctx:
-                        with progress_ctx as bar:
-                            for fut in iterator:
-                                key,recs=future_map[fut]
-                                try:
-                                    res=fut.result()
-                                except Exception as exc:
-                                    print(f"[!] nuclei error on {key[0]}:{key[1]} - {exc}")
-                                    res=''
-                                NUCLEI_CACHE[key]=res
-                                if res:
-                                    for r in recs:
-                                        r['nuclei']=res
-                                bar()
-                    else:
+                for key,ip,port,host_header,recs in nuclei_tasks:
+                    print(f"[i] nuclei target {ip}:{port} (host {host_header or '-'})")
+                    res=run_nuclei(ip,port,host_header)
+                    NUCLEI_CACHE[key]=res
+                    if res:
+                        for r in recs:
+                            r['nuclei']=res
+        else:
+            print(f"[i] Running nuclei with {workers} worker threads")
+            progress_ctx=(alive_bar(len(nuclei_tasks),title="nuclei scans") if _HAS_ALIVE else None)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map={}
+                for key,ip,port,host_header,recs in nuclei_tasks:
+                    future=executor.submit(run_nuclei,ip,port,host_header)
+                    future_map[future]=(key,recs)
+                iterator=as_completed(future_map)
+                if progress_ctx:
+                    with progress_ctx as bar:
                         for fut in iterator:
                             key,recs=future_map[fut]
                             try:
@@ -580,15 +552,27 @@ def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False
                             if res:
                                 for r in recs:
                                     r['nuclei']=res
+                            bar()
+                else:
+                    for fut in iterator:
+                        key,recs=future_map[fut]
+                        try:
+                            res=fut.result()
+                        except Exception as exc:
+                            print(f"[!] nuclei error on {key[0]}:{key[1]} - {exc}")
+                            res=''
+                        NUCLEI_CACHE[key]=res
+                        if res:
+                            for r in recs:
+                                r['nuclei']=res
+    else:
+        total_candidates=cache_hits+non_http_skips+dedup_skips
+        if cache_hits:
+            print(f"[i] Nuclei reused cache for {cache_hits} targets; nothing new to scan")
+        elif total_candidates:
+            print(f"[i] No nuclei targets remaining (non-http skipped {non_http_skips}, dedup {dedup_skips})")
         else:
-            total_candidates=cache_hits+non_http_skips+dedup_skips
-            if cache_hits:
-                print(f"[i] Nuclei reused cache for {cache_hits} targets; nothing new to scan")
-            elif total_candidates:
-                print(f"[i] No nuclei targets remaining (non-http skipped {non_http_skips}, dedup {dedup_skips})")
-            else:
-                print("[i] No HTTP-like services identified for nuclei")
-    return results
+            print("[i] No HTTP-like services identified for nuclei")
 
 # ---------- main ----------
 if __name__=="__main__":
@@ -621,7 +605,8 @@ if __name__=="__main__":
     a=p.parse_args()
 
     ips=process_input_file(a.input) if a.input else set()
-    excludes=process_input_file(a.exclude_file) if a.exclude_file else set()
+    exclude_list=process_input_file(a.exclude_file) if a.exclude_file else set()
+    exclude_ips={str(ip) for ip in exclude_list if is_ip(ip)}
     chosen_resolvers=[]
     if not a.use_system_resolvers:
         if a.dns_resolvers:
@@ -631,20 +616,27 @@ if __name__=="__main__":
     configure_dns_resolver(chosen_resolvers)
 
     allres=defaultdict(list)
+    explicit_ips={str(ip) for ip in ips if is_ip(ip)}
+    if exclude_ips:
+        print(f"[i] Excluding {len(exclude_ips)} IPs from scans")
+        for ip in sorted(exclude_ips,key=ip_sort_key):
+            print(f"    - {ip}")
     for d in a.domains:
-        r=scan_domain(d,ips,skip=a.skip_scans,
-                      scan_all=a.scan_all_ips_per_fqdn,
-                      prefer_input_ip=a.prefer_input_ip,
-                      nmap_top_ports=a.nmap_top_ports,
-                      nmap_timeout=a.nmap_timeout,
-                      nuclei_single_web_port=a.nuclei_single_web_port,
-                      resolvers=chosen_resolvers or None,
-                      apply_wildcard_filter=not a.no_wildcard_filter,
-                      gobuster_wordlist=a.gobuster_wordlist,
-                      gobuster_threads=a.gobuster_threads,
-                      use_gobuster=not a.skip_gobuster,
-                      nuclei_workers=a.nuclei_workers,
-                      nmap_workers=a.nmap_workers)
-        for ip,recs in r.items(): allres[ip].extend(recs)
+        enum_res=enumerate_domain(d,ips,
+                                  scan_all=a.scan_all_ips_per_fqdn,
+                                  prefer_input_ip=a.prefer_input_ip,
+                                  resolvers=chosen_resolvers or None,
+                                  apply_wildcard_filter=not a.no_wildcard_filter,
+                                  gobuster_wordlist=a.gobuster_wordlist,
+                                  gobuster_threads=a.gobuster_threads,
+                                  use_gobuster=not a.skip_gobuster)
+        merge_results(allres,enum_res)
+    ensure_input_ips(allres,explicit_ips,exclude_ips)
+    run_scans(allres,a.skip_scans,explicit_ips,exclude_ips,
+              nmap_top_ports=a.nmap_top_ports,
+              nmap_timeout=a.nmap_timeout,
+              nuclei_single_web_port=a.nuclei_single_web_port,
+              nuclei_workers=a.nuclei_workers,
+              nmap_workers=a.nmap_workers)
     outfile=f"new-recon-{a.domains[0]}_output.csv"
     write_csv(outfile,allres)
