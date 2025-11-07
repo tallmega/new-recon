@@ -30,6 +30,8 @@ try:
     _HAS_ALIVE=True
 except Exception:
     _HAS_ALIVE=False
+if _HAS_ALIVE and not sys.stdout.isatty():
+    _HAS_ALIVE=False
 
 LIKELY_HTTP_PORTS={80,81,3000,5000,7001,7080,7081,7443,8000,8008,8080,8081,8088,
                    8181,8443,8448,8880,8888,9000,9080,9090,9200,9443,10000,10443,
@@ -50,7 +52,8 @@ def run_with_spinner(label, fn):
             error['exc']=exc
     t=Thread(target=_runner,daemon=True)
     t.start()
-    with alive_bar(total=None,title=label,bar='classic',spinner='dots_waves2') as bar:
+    with alive_bar(total=None,title=label,bar='classic',spinner='dots_waves2',
+                   enrich_print=False) as bar:
         while t.is_alive():
             time.sleep(0.1)
             bar()
@@ -417,7 +420,7 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
                             for ip in target_ips}
                 completed=as_completed(future_map)
                 if _HAS_ALIVE:
-                    with alive_bar(total_targets,title="nmap scans") as bar:
+                    with alive_bar(total_targets,title="nmap scans",enrich_print=False) as bar:
                         for fut in completed:
                             ip=future_map[fut]
                             try:
@@ -514,7 +517,7 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
               f"(cache hits {cache_hits}, non-http skipped {non_http_skips}, dedup {dedup_skips})")
         if workers<=1:
             if _HAS_ALIVE:
-                with alive_bar(len(nuclei_tasks),title="nuclei scans") as bar:
+                with alive_bar(len(nuclei_tasks),title="nuclei scans",enrich_print=False) as bar:
                     for key,ip,port,host_header,recs in nuclei_tasks:
                         res=run_nuclei(ip,port,host_header)
                         NUCLEI_CACHE[key]=res
@@ -532,7 +535,7 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
                             r['nuclei']=res
         else:
             print(f"[i] Running nuclei with {workers} worker threads")
-            progress_ctx=(alive_bar(len(nuclei_tasks),title="nuclei scans") if _HAS_ALIVE else None)
+            progress_ctx=(alive_bar(len(nuclei_tasks),title="nuclei scans",enrich_print=False) if _HAS_ALIVE else None)
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_map={}
                 for key,ip,port,host_header,recs in nuclei_tasks:
