@@ -203,7 +203,7 @@ def looks_like_http(ip,port,host_header=None,timeout=2.0):
     return is_http
 
 # ---------- scanning ----------
-def scan_ports(ip,skip=False,nmap_top_ports=5000,nmap_timeout="90s"):
+def scan_ports(ip,skip=False,nmap_top_ports=5000,nmap_timeout="90s",nmap_extra=None):
     if skip: return 'N/A'
     ip_str=str(ip)
     try: is6=ipaddress.ip_address(ip_str).version==6
@@ -211,6 +211,8 @@ def scan_ports(ip,skip=False,nmap_top_ports=5000,nmap_timeout="90s"):
     cmd=['nmap','-Pn','--top-ports',str(nmap_top_ports),
          '--host-timeout',str(nmap_timeout),ip_str]
     if is6: cmd.insert(1,'-6')
+    if nmap_extra:
+        cmd[1:1]=nmap_extra
     print(f"[i] Scanning {ip_str} (top {nmap_top_ports})")
     ports=set()
     try:
@@ -269,14 +271,23 @@ def write_csv(outfile,data):
         w=csv.DictWriter(f,fieldnames=fn); w.writeheader()
         for ip,recs in sorted(data.items(),key=lambda x:ip_sort_key(x[0])):
             dns=', '.join(sorted(set(r['dns'] for r in recs if r['dns'])))
-            ports=set(); nuc=set(); all_na=True
+            ports=set(); nuc=set(); all_na=True; excluded=False
             for r in recs:
                 op=r['ports']
-                if isinstance(op,str) and op=='N/A': continue
+                if isinstance(op,str):
+                    if op=='N/A':
+                        continue
+                    if op=='Excluded':
+                        excluded=True
+                        all_na=False
+                        continue
                 all_na=False
                 if isinstance(op,set): ports|=op
                 if r['nuclei']: nuc|={r['nuclei']}
-            ports_str='N/A' if all_na else ('None' if not ports else ', '.join(sorted(ports,key=proto_port_sort_key)))
+            if excluded:
+                ports_str='Excluded'
+            else:
+                ports_str='N/A' if all_na else ('None' if not ports else ', '.join(sorted(ports,key=proto_port_sort_key)))
             nuc_str=', '.join(sorted(x for x in nuc if x))
             w.writerow({'DNS':dns,'IP / Hosting Provider':ip,'Ports':ports_str,'Nuclei':nuc_str,'Notes':''})
     print(f"[i] CSV written: {outfile}")
@@ -337,7 +348,12 @@ def run_gobuster(domain,wordlist,resolvers=None,threads=50,force_wildcard=True):
 def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False,
                 nmap_top_ports=500,nmap_timeout="90s",nuclei_single_web_port=True,
                 resolvers=None,apply_wildcard_filter=True,gobuster_wordlist=None,
-                gobuster_threads=50,use_gobuster=True,nuclei_workers=1):
+                gobuster_threads=50,use_gobuster=True,nuclei_workers=1,nmap_workers=4,
+                exclude_ips=None,input_ip_tracker=None,nmap_cache=None,nuclei_seen=None):
+    exclude_ips=exclude_ips or set()
+    input_ip_tracker=input_ip_tracker if input_ip_tracker is not None else set()
+    nmap_cache=nmap_cache if nmap_cache is not None else {}
+    nuclei_seen=nuclei_seen if nuclei_seen is not None else set()
     print(f"[i] Enumerating {domain}")
     wildcard_ips=set()
     wildcard_hits=set()
@@ -373,17 +389,86 @@ def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False
         print(f"[i] Filtered {len(wildcard_hits)} total wildcard hostnames")
 
     results=defaultdict(list)
+    explicit_ips={str(ip) for ip in input_ips if is_ip(ip)}
+    exclude_ips={ip for ip in excludes if is_ip(ip)}
+    if exclude_ips:
+        print(f"[i] Excluding {len(exclude_ips)} IPs from scans")
+        for ip in sorted(exclude_ips,key=ip_sort_key):
+            print(f"    - {ip}")
     for s in sorted(subs):
         ips=choose_ips_for_fqdn(s,scan_all,input_ips,prefer_input_ip)
         for ip in ips:
-            results[str(ip)].append({'dns':s,'ports':set(),'nuclei':''})
-    for i in input_ips:
-        if is_ip(i): results.setdefault(i,[])
+            ip_str=str(ip)
+            rec={'dns':s,'ports':set(),'nuclei':'','excluded':False}
+            if ip_str in exclude_ips:
+                rec['ports']='Excluded'
+                rec['excluded']=True
+        results[ip_str].append(rec)
+    for raw_ip in explicit_ips:
+        ip_key=str(raw_ip)
+        recs=results.setdefault(ip_key,[])
+        if not recs:
+            recs.append({'dns':'','ports':('Excluded' if ip_key in exclude_ips else set()),'nuclei':'','excluded':ip_key in exclude_ips})
 
     # nmap
-    scanres={ip:scan_ports(ip,skip,nmap_top_ports,nmap_timeout) for ip in results}
+    nmap_extra=[]
+    scanres={}
+    if not skip:
+        total_targets=len(results)
+        if len(results)>1:
+            print(f"[i] Scanning {total_targets} IPs with nmap (parallel)")
+            iterator_results=[]
+            with ThreadPoolExecutor(max_workers=nmap_workers) as executor:
+                future_map={executor.submit(scan_ports,ip,skip,nmap_top_ports,nmap_timeout,nmap_extra):ip
+                            for ip in results}
+                completed=as_completed(future_map)
+                if _HAS_ALIVE:
+                    with alive_bar(total_targets,title="nmap scans") as bar:
+                        for fut in completed:
+                            ip=future_map[fut]
+                            try:
+                                scanres[ip]=fut.result()
+                            except Exception as exc:
+                                print(f"[!] nmap error for {ip}: {exc}")
+                                scanres[ip]='N/A'
+                            bar()
+                else:
+                    for fut in completed:
+                        ip=future_map[fut]
+                        print(f"[i] nmap target {ip}")
+                        try:
+                            scanres[ip]=fut.result()
+                        except Exception as exc:
+                            print(f"[!] nmap error for {ip}: {exc}")
+                            scanres[ip]='N/A'
+        else:
+            for ip in results:
+                if _HAS_ALIVE:
+                    with alive_bar(1,title="nmap scans") as bar:
+                        scanres[ip]=scan_ports(ip,skip,nmap_top_ports,nmap_timeout,nmap_extra)
+                        bar()
+                else:
+                    print(f"[i] nmap target {ip}")
+                    scanres[ip]=scan_ports(ip,skip,nmap_top_ports,nmap_timeout,nmap_extra)
+    else:
+        for ip in results: scanres[ip]='N/A'
+
+    if not skip:
+        if exclude_ips:
+            for ip in exclude_ips:
+                scanres[ip]='Excluded'
+        for ip in explicit_ips:
+            if ip in results and scanres.get(ip,'N/A')=='N/A':
+                print(f"[i] nmap returned no data for {ip}; treating as no open ports")
+                scanres[ip]=set()
+
     for ip,recs in results.items():
-        for r in recs: r['ports']=scanres[ip]
+        if ip in exclude_ips:
+            ports_val='Excluded'
+        else:
+            ports_val=scanres.get(ip,'N/A')
+        for r in recs:
+            r['ports']=ports_val
 
     if not skip:
         if nuclei_single_web_port:
@@ -396,6 +481,8 @@ def scan_domain(domain,input_ips,skip=False,scan_all=False,prefer_input_ip=False
         dedup_skips=0
         non_http_skips=0
         for ip,recs in results.items():
+            if ip in exclude_ips:
+                continue
             op=scanres[ip]
             if not isinstance(op,set) or not op:
                 continue
@@ -509,11 +596,14 @@ if __name__=="__main__":
     p.add_argument("domains",nargs="+")
     p.add_argument("-i","--input")
     p.add_argument("--skip-scans",action="store_true")
+    p.add_argument("--exclude-file",help="File containing IPs to exclude from scanning")
     p.add_argument("--scan-all-ips-per-fqdn",action="store_true")
     p.add_argument("--prefer-input-ip",action="store_true")
     p.add_argument("--nmap-top-ports",type=int,default=5000)
     p.add_argument("--nmap-timeout",default="90s")
     p.add_argument("--nuclei-single-web-port",action="store_true",default=True)
+    p.add_argument("--nmap-workers",type=int,default=4,
+                   help="Parallel nmap worker threads (default 4)")
     p.add_argument("--nuclei-workers",type=int,default=4,
                    help="Number of parallel nuclei workers to run (>=1)")
     p.add_argument("--dns-resolver",action="append",dest="dns_resolvers",
@@ -531,6 +621,7 @@ if __name__=="__main__":
     a=p.parse_args()
 
     ips=process_input_file(a.input) if a.input else set()
+    excludes=process_input_file(a.exclude_file) if a.exclude_file else set()
     chosen_resolvers=[]
     if not a.use_system_resolvers:
         if a.dns_resolvers:
@@ -552,7 +643,8 @@ if __name__=="__main__":
                       gobuster_wordlist=a.gobuster_wordlist,
                       gobuster_threads=a.gobuster_threads,
                       use_gobuster=not a.skip_gobuster,
-                      nuclei_workers=a.nuclei_workers)
+                      nuclei_workers=a.nuclei_workers,
+                      nmap_workers=a.nmap_workers)
         for ip,recs in r.items(): allres[ip].extend(recs)
-    outfile=f"{a.domains[0]}_output.csv"
+    outfile=f"new-recon-{a.domains[0]}_output.csv"
     write_csv(outfile,allres)
