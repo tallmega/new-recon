@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, csv, ipaddress, os, re, socket, subprocess, sys, time, uuid, ssl
+import argparse, csv, ipaddress, os, re, socket, subprocess, sys, time, uuid, ssl, atexit
 from collections import defaultdict
 from functools import lru_cache
 from threading import Thread
@@ -30,8 +30,25 @@ try:
     _HAS_ALIVE=True
 except Exception:
     _HAS_ALIVE=False
-if _HAS_ALIVE and not sys.stdout.isatty():
+def _tty_supports_alive() -> bool:
+    if not sys.stdout.isatty():
+        return False
+    term=os.environ.get("TERM","").lower()
+    if term in {"dumb",""}:
+        return False
+    return True
+
+if _HAS_ALIVE and not _tty_supports_alive():
     _HAS_ALIVE=False
+else:
+    # Ensure cursor is restored even if alive_progress glitches
+    def _restore_cursor():
+        try:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
+    atexit.register(_restore_cursor)
 
 LIKELY_HTTP_PORTS={80,81,3000,5000,7001,7080,7081,7443,8000,8008,8080,8081,8088,
                    8181,8443,8448,8880,8888,9000,9080,9090,9200,9443,10000,10443,
@@ -360,13 +377,12 @@ def enumerate_domain(domain,input_ips,scan_all=False,prefer_input_ip=False,
             print(f"[i] Wildcard detected for {domain}: {', '.join(sorted(wildcard_ips,key=ip_sort_key))}")
     subs=set()
     if wildcard_ips:
-        print("[i] Skipping subfinder because wildcard DNS is present")
-    else:
-        subs=run_subfinder(domain,resolvers)
-        if subs:
-            print(f"[i] subfinder discovered {len(subs)} names for {domain}")
-            subs,removed=filter_wildcard_hosts(subs,wildcard_ips)
-            wildcard_hits|=removed
+        print("[i] Wildcard detected; subfinder results will be filtered")
+    subs=run_subfinder(domain,resolvers)
+    if subs:
+        print(f"[i] subfinder discovered {len(subs)} names for {domain}")
+        subs,removed=filter_wildcard_hosts(subs,wildcard_ips)
+        wildcard_hits|=removed
     if use_gobuster:
         if not gobuster_wordlist:
             print("[i] Skipping gobuster (no wordlist provided)")
@@ -605,6 +621,8 @@ if __name__=="__main__":
                    help="Number of gobuster threads")
     p.add_argument("--skip-gobuster",action="store_true",
                    help="Skip gobuster dns enumeration")
+    p.add_argument("--domain-delay",type=float,default=300.0,
+                   help="Seconds to sleep between domain enumerations (default 300.0)")
     a=p.parse_args()
 
     ips=process_input_file(a.input) if a.input else set()
@@ -624,7 +642,8 @@ if __name__=="__main__":
         print(f"[i] Excluding {len(exclude_ips)} IPs from scans")
         for ip in sorted(exclude_ips,key=ip_sort_key):
             print(f"    - {ip}")
-    for d in a.domains:
+    total_domains=len(a.domains)
+    for idx,d in enumerate(a.domains):
         enum_res=enumerate_domain(d,ips,
                                   scan_all=a.scan_all_ips_per_fqdn,
                                   prefer_input_ip=a.prefer_input_ip,
@@ -634,6 +653,9 @@ if __name__=="__main__":
                                   gobuster_threads=a.gobuster_threads,
                                   use_gobuster=not a.skip_gobuster)
         merge_results(allres,enum_res)
+        if a.domain_delay>0 and total_domains>1 and idx<total_domains-1:
+            print(f"[i] Waiting {a.domain_delay:.1f}s before next domain to ease DNS load")
+            time.sleep(a.domain_delay)
     ensure_input_ips(allres,explicit_ips,exclude_ips)
     run_scans(allres,a.skip_scans,explicit_ips,exclude_ips,
               nmap_top_ports=a.nmap_top_ports,

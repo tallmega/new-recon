@@ -24,8 +24,9 @@ import tempfile
 BASE_COLUMNS = ["DNS", "IP / Hosting Provider", "Ports", "Nuclei", "Notes"]
 STATUS_PATTERN = re.compile(r"\b(401|403|404)\b")
 HOST_TOKEN_RE = re.compile(
-    r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+|"
-    r"(?:\d{1,3}\.){3}\d{1,3})"
+    r"(?:\[[0-9A-Fa-f:]+\]|"
+    r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+)|"
+    r"(?:\d{1,3}\.){3}\d{1,3})(?::\d{1,5})?"
 )
 IP_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
 
@@ -42,6 +43,7 @@ class TargetHost:
 @dataclass
 class FfufFinding:
     top_redirect: Optional[str]
+    top_redirect_status: Optional[int]
     first_ok_path: Optional[str]
     auth_hit: Optional[Tuple[int, str]]
     out_of_scope_hosts: Set[str]
@@ -122,6 +124,19 @@ def sanitize_host_token(token: str) -> str:
     if token.startswith("[") and token.endswith("]"):
         token = token[1:-1]
     return token
+
+
+NOTE_PORT_SUFFIX = re.compile(r":\d{1,5}$")
+
+
+def strip_port_suffix(token: str) -> str:
+    token = token.strip()
+    if token.startswith("[") and "]" in token:
+        prefix, _, remainder = token.partition("]")
+        if remainder.startswith(":"):
+            return prefix + "]"
+        return token
+    return NOTE_PORT_SUFFIX.sub("", token)
 
 
 def split_hosts(cell: str) -> List[str]:
@@ -284,7 +299,8 @@ def detect_hosts_in_notes(notes: str, row_hosts_lower: Dict[str, str]) -> Set[st
         colon_split = frag.split(":", 1)
         head = colon_split[0] if len(colon_split) == 2 else frag
         for token in HOST_TOKEN_RE.findall(head):
-            norm = normalize_host(token)
+            base = strip_port_suffix(token)
+            norm = normalize_host(base)
             if norm in row_hosts_lower:
                 matched.add(row_hosts_lower[norm])
         # fallback: if no host token matched, but fragment mentions a host substring
@@ -404,6 +420,7 @@ def analyze_ffuf_results(
     max_results_per_status: int,
 ) -> FfufFinding:
     redirect_counter: Counter[str] = Counter()
+    status_by_path: Dict[str, int] = {}
     first_ok_path: Optional[str] = None
     auth_hit: Optional[Tuple[int, str]] = None
     out_of_scope: Set[str] = set()
@@ -423,6 +440,7 @@ def analyze_ffuf_results(
         path = normalize_path((parsed_url.path or "").split("?", 1)[0])
         if status == 200 and not first_ok_path:
             first_ok_path = path
+            status_by_path.setdefault(path, status)
             continue
         if status in (301, 302):
             dest_host, dest_path = _parse_redirect_target(redirect, base_host)
@@ -436,12 +454,17 @@ def analyze_ffuf_results(
             if baseline_status is None or status != baseline_status:
                 if not auth_hit:
                     auth_hit = (status, path)
+            status_by_path.setdefault(path, status)
             continue
+        status_by_path.setdefault(path, status)
     top_redirect = None
+    top_redirect_status = None
     if redirect_counter:
         top_redirect = max(redirect_counter.items(), key=lambda item: (item[1], item[0]))[0]
+        top_redirect_status = status_by_path.get(top_redirect)
     return FfufFinding(
         top_redirect=top_redirect,
+        top_redirect_status=top_redirect_status,
         first_ok_path=first_ok_path,
         auth_hit=auth_hit,
         out_of_scope_hosts=out_of_scope,
@@ -451,7 +474,8 @@ def analyze_ffuf_results(
 def format_findings(label: str, finding: FfufFinding) -> str:
     parts: List[str] = []
     if finding.top_redirect:
-        parts.append(f"redirect -> {finding.top_redirect}")
+        status_suffix = f" [{finding.top_redirect_status}]" if finding.top_redirect_status else ""
+        parts.append(f"redirect -> {finding.top_redirect}{status_suffix}")
     elif finding.first_ok_path:
         parts.append(f"200 -> {finding.first_ok_path}")
     elif finding.auth_hit:
@@ -461,8 +485,8 @@ def format_findings(label: str, finding: FfufFinding) -> str:
         oos = ", ".join(sorted(finding.out_of_scope_hosts))
         parts.append(f"oos -> {oos}")
     if not parts:
-        return f"Fuzz {label}: no ffuf matches"
-    return f"Fuzz {label}: " + " ; ".join(parts)
+        return f"Fuzzing Results - {label}: no ffuf matches"
+    return f"Fuzzing Results - {label}: " + " ; ".join(parts)
 
 
 def append_notes(original: str, addition: str) -> str:

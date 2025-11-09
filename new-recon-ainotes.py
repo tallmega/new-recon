@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 from typing import List, Tuple, Dict, Optional
 
 # ---------- Optional progress bar ----------
@@ -43,7 +44,8 @@ def get_openai_client():
 
 # ---------- Constants / Regex ----------
 WEB_PORTS = [443, 80, 8080, 8443, 8008, 8000, 8888, 3000, 5000]
-PORT_PREFERENCE = [443, 80, 8080, 8443, 8008, 8000, 8888, 3000, 5000]
+PORT_PREFERENCE = [443, 8443, 9443, 10443, 80, 8080, 8000, 8888, 3000, 5000]
+HTTPS_PORTS = {443, 4443, 5443, 6443, 7443, 8443, 9443, 10443}
 
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 IPV6_RE = re.compile(r"\b([0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
@@ -130,16 +132,29 @@ def parse_ports_cell(ports_cell: str):
                 pass
     return out
 
-def choose_scheme_and_port(ports) -> Optional[Tuple[str, int]]:
-    if "NONE" in ports:
-        return None
+def choose_schemes_and_ports(ports: List[int], limit: int) -> List[Tuple[str, int]]:
+    if limit <= 0 or "NONE" in ports:
+        return []
     webset = [p for p in ports if isinstance(p, int) and p in WEB_PORTS]
     if not webset:
-        return None
-    for p in PORT_PREFERENCE:
-        if p in webset:
-            return ("https", 443) if p == 443 else ("http", p)
-    return None
+        return []
+    ordered = []
+    seen = set()
+    for pref in PORT_PREFERENCE:
+        if pref in webset and pref not in seen:
+            ordered.append(pref)
+            seen.add(pref)
+    for p in sorted(set(webset)):
+        if p not in seen:
+            ordered.append(p)
+            seen.add(p)
+    combos = []
+    for port in ordered:
+        scheme = "https" if port in HTTPS_PORTS else "http"
+        combos.append((scheme, port))
+        if len(combos) >= limit:
+            break
+    return combos
 
 def split_hosts(dns_cell: str, max_hosts:int) -> List[str]:
     if not dns_cell:
@@ -152,6 +167,70 @@ def split_hosts(dns_cell: str, max_hosts:int) -> List[str]:
             if len(out) >= max_hosts:
                 break
     return out
+
+def format_target_label(host: str, scheme: str, port: int) -> str:
+    label = host.strip()
+    if ":" in label and not label.startswith("["):
+        label = f"[{label}]"
+    default_port = 443 if scheme == "https" else 80
+    if port == default_port:
+        return f"{scheme}://{label}"
+    return f"{scheme}://{label}:{port}"
+
+
+def summarize_path(path: str) -> str:
+    if not path or path == "/":
+        return ""
+    path = path.strip()
+    segments = path.strip("/").split("/")
+    if len(segments) > 2:
+        return "/" + "/".join(segments[:2]) + "/..."
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def parse_location_target(raw: str, fallback_scheme: str, fallback_host: str) -> Tuple[str, str, str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return "", "", ""
+    parsed = None
+    if raw.startswith("//"):
+        scheme = fallback_scheme or "https"
+        parsed = urlparse(f"{scheme}:{raw}")
+    elif raw.startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+    if parsed:
+        scheme = parsed.scheme or fallback_scheme or ""
+        host = parsed.netloc or fallback_host or ""
+        path = parsed.path or ""
+        return scheme.lower(), host, path
+    if raw.startswith("/"):
+        return fallback_scheme or "", fallback_host or "", raw
+    if "/" in raw:
+        host, rest = raw.split("/", 1)
+        return "", host, "/" + rest
+    return fallback_scheme or "", fallback_host or "", f"/{raw}"
+
+
+def summarize_redirect_display(orig_host: str, orig_scheme: str,
+                               dest_scheme: str, dest_host: str, dest_path: str) -> str:
+    orig_host_norm = (orig_host or "").lower()
+    dest_host_norm = (dest_host or "").lower()
+    path_summary = summarize_path(dest_path)
+    same_host = bool(orig_host_norm and dest_host_norm and orig_host_norm == dest_host_norm)
+    if same_host:
+        if dest_scheme and orig_scheme and dest_scheme != orig_scheme:
+            return dest_scheme
+        if path_summary:
+            return path_summary.lstrip("/") or "/"
+        return dest_scheme or dest_host or "/"
+    target = dest_host or ""
+    if dest_scheme:
+        target = f"{dest_scheme}://{target}" if target else dest_scheme
+    if path_summary:
+        target += path_summary
+    return target or dest_scheme or "/"
 
 def extract_ip_from_provider_cell(cell: str) -> Optional[str]:
     if not cell:
@@ -237,19 +316,18 @@ def local_fallback_note(res: dict) -> str:
     m = _HTTP_STATUS_RE.search(res.get("stdout") or "")
     code = m.group(1) if m else None
 
-    loc = ""
+    raw_loc = ""
     lm = _LOCATION_RE.search(res.get("stdout") or "")
     if lm:
-        loc = re.sub(r"^https?://", "", lm.group(1)).rstrip("/")
+        raw_loc = lm.group(1).strip()
+    orig_host = (res.get("host") or "").strip().rstrip(".")
+    orig_scheme = (res.get("scheme") or "").lower()
 
     parts = []
-    if code and loc and code in ("301","302","307","308"):
-        host = loc.split("/", 1)[0]
-        path = "/" + loc.split("/",1)[1] if "/" in loc else ""
-        if path.count("/") > 2:
-            segs = path.strip("/").split("/")
-            path = "/" + "/".join(segs[:2]) + "/..."
-        parts.append(f"{code} -> {host}{path}")
+    if code and raw_loc and code in ("301","302","307","308"):
+        dest_scheme, dest_host, dest_path = parse_location_target(raw_loc, orig_scheme, orig_host)
+        display = summarize_redirect_display(orig_host, orig_scheme, dest_scheme, dest_host, dest_path)
+        parts.append(f"{code} -> {display}")
     elif code:
         label = {
             "200":"200 OK",
@@ -374,7 +452,12 @@ def build_user_prompt(host_results: List[Dict[str, str]], nuclei_hint: Optional[
         lines.append(f"NUCLEI: {nuclei_hint.strip()}")
     lines.append("")
     for res in host_results:
-        part = [f"HOST: {res['url']}", f"RETURNCODE: {res['rc']}"]
+        label = res.get("label")
+        if label:
+            part = [f"TARGET: {label}", f"HOST: {res['url']}"]
+        else:
+            part = [f"HOST: {res['url']}"]
+        part.append(f"RETURNCODE: {res['rc']}")
         if res.get("stderr"):
             part.append("STDERR:\n" + res["stderr"].strip())
         if res.get("stdout"):
@@ -416,7 +499,7 @@ def analyze_chunk_with_openai(client, model: str, host_results: List[Dict[str, s
     return [""] * len(host_results), [""] * len(host_results)
 
 # ---------- Grouping across whole row ----------
-def group_and_format(hosts: List[str], notes_all: List[str], sigs_all: List[str], frag_limit: int) -> str:
+def group_and_format(target_labels: List[str], notes_all: List[str], sigs_all: List[str], frag_limit: int) -> str:
     """
     Combine hosts with identical 'sig' into concise fragments.
     - Redirect sigs "30x->target" become: "h1, h2 -> target (tech...)" when tech present
@@ -429,7 +512,7 @@ def group_and_format(hosts: List[str], notes_all: List[str], sigs_all: List[str]
 
     frags = []
     for sig, idxs in groups.items():
-        group_hosts = [hosts[i] for i in idxs]
+        group_hosts = [target_labels[i] for i in idxs]
 
         # choose first non-empty note; else fallback
         rep_note = ""
@@ -474,7 +557,7 @@ def ensure_required_fields(fieldnames):
 # ---------- Main processing ----------
 def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: int, timeout: int,
                 ua: str, max_bytes: int, model: str, show_headers: bool, frag_limit: int,
-                chunk_size: int, follow_one: bool):
+                chunk_size: int, follow_one: bool, max_ports_per_host: int):
     client = get_openai_client()
 
     with open(input_path, newline="", encoding="utf-8-sig") as f:
@@ -499,12 +582,11 @@ def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: 
         nuclei_hint = (row.get("Nuclei") or "").strip()
 
         ports = parse_ports_cell(ports_cell)
-        choice = choose_scheme_and_port(ports)
-        if choice is None:
+        port_choices = choose_schemes_and_ports(ports, max_ports_per_host)
+        if not port_choices:
             out_rows.append(row)
             if _HAS_ALIVE: iter_rows.text = f"{idx+1}/{total} skip (non-web)"
             continue
-        scheme, port = choice
 
         hostnames = split_hosts(dns_cell, max_hosts_per_row)
         if not hostnames:
@@ -515,13 +597,28 @@ def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: 
                 continue
             hostnames = [ip]
 
+        targets = []
+        for hostname in hostnames:
+            for scheme, port in port_choices:
+                targets.append((hostname, scheme, port, format_target_label(hostname, scheme, port)))
+        if not targets:
+            out_rows.append(row)
+            if _HAS_ALIVE: iter_rows.text = f"{idx+1}/{total} skip (no targets)"
+            continue
+        target_labels = [t[3] for t in targets]
+
         if _HAS_ALIVE:
-            iter_rows.text = f"{idx+1}/{total} {hostnames[0][:50]}"
+            iter_rows.text = f"{idx+1}/{total} {target_labels[0][:50]}"
 
         host_results = []
-        for hostname in hostnames:
-            if _HAS_ALIVE: iter_rows.text = f"{idx+1}/{total} curl {hostname}:{port}"
+        for hostname, scheme, port, label in targets:
+            if _HAS_ALIVE:
+                iter_rows.text = f"{idx+1}/{total} curl {label}"
             res = run_curl(hostname, scheme, port, timeout, ua, max_bytes)
+            res["label"] = label
+            res["host"] = hostname
+            res["scheme"] = scheme
+            res["port"] = port
 
             # one-hop follow after 30x to capture tech/meta on destination
             code, loc = parse_status_and_location(res.get("stdout",""))
@@ -571,7 +668,7 @@ def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: 
             notes_all.extend(notes)
             sigs_all.extend(sigs)
 
-        combined = group_and_format(hostnames, notes_all, sigs_all, frag_limit=frag_limit)
+        combined = group_and_format(target_labels, notes_all, sigs_all, frag_limit=frag_limit)
         row["Notes"] = combined
         out_rows.append(row)
 
@@ -600,6 +697,7 @@ def main():
     # follow-one enabled by default; provide opt-out switch
     parser.add_argument("--no-follow-one", dest="follow_one", action="store_false", help="Disable one-hop follow after 30x")
     parser.set_defaults(follow_one=True)
+    parser.add_argument("--max-ports-per-host", type=int, default=5, help="Max HTTP-like ports to curl per host (default 5)")
     args = parser.parse_args()
 
     process_csv(
@@ -614,6 +712,7 @@ def main():
         frag_limit=args.max_fragment_len,
         chunk_size=args.chunk_size,
         follow_one=args.follow_one,
+        max_ports_per_host=args.max_ports_per_host,
     )
 
 if __name__ == "__main__":
