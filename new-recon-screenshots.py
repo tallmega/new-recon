@@ -31,6 +31,8 @@ except Exception:
 HTTP_PORTS={80,81,3000,5000,7001,7080,7081,7443,8000,8008,8080,8081,8088,
             8181,8443,8448,8880,8888,9000,9080,9090,9200,9443,10000,10443,
             11080,12000,12345,16080,18080,443,4443,4444,451,591,593,8320}
+PRIMARY_HTTP_PORTS={80,443}
+ALT_HTTP_PORTS={8080,8443,8880,8008,8015}
 
 IMAGE_EXTS=(".png",".jpg",".jpeg",".webp",".bmp",".gif")
 BASE_COLS=["DNS","IP / Hosting Provider","Ports","Nuclei"]
@@ -172,6 +174,7 @@ OK_RE=re.compile(r"200\s*->\s*([^;|]+)",re.IGNORECASE)
 STATUS_SUFFIX_RE=re.compile(r"\s*\[([0-9]{3})\]\s*$")
 NOTE_REDIRECT_RE=re.compile(r"(https?://[^\s;,]+)\s*->\s*([^;|]+)")
 FILE_EXT_HINTS={"php","asp","aspx","jsp","html","htm","cgi","pl","cfm","php5","php7","jspx","do","action"}
+FUZZ_NO_MATCH_RE=re.compile(r"Fuzzing Results\s*-\s*(?:[^:]+:\s*)?no\s+ffuf\s+matches",re.IGNORECASE)
 
 def _split_note_fragments(notes:str) -> List[str]:
     frags=[]
@@ -185,6 +188,11 @@ def _split_note_fragments(notes:str) -> List[str]:
         else:
             frags.append(part)
     return frags
+
+def sanitize_fuzzing_text(text:str) -> str:
+    if not text:
+        return ""
+    return FUZZ_NO_MATCH_RE.sub("Fuzzing Results - no matches",text)
 
 def _normalize_url_for_match(url:str) -> str:
     return url.lower().rstrip("/")
@@ -419,6 +427,8 @@ def build_targets(rows:List[Dict[str,str]],max_hosts:int,only_interesting:bool) 
         provider_ip=extract_ip(row.get("IP / Hosting Provider",""))
         if not hosts and provider_ip:
             hosts=[provider_ip]
+        canonical_hosts={canonical_host(h) for h in hosts if h}
+        skip_www_hosts={h for h in canonical_hosts if h.startswith("www.") and h[4:] in canonical_hosts}
         ports=parse_ports_cell(row.get("Ports",""))
         http_ports=select_http_ports(ports)
         notes=row.get(NOTES_COL,"") or ""
@@ -430,36 +440,51 @@ def build_targets(rows:List[Dict[str,str]],max_hosts:int,only_interesting:bool) 
         if provider_ip:
             known_hosts.add(canonical_host(provider_ip))
         row_entries=[]
+        hosts_with_primary_http=set()
 
-        def add_entry(target:Target,fragment_idx:Optional[int]):
+        def add_entry(target:Target,fragment_idx:Optional[int],source:str="port")->bool:
+            canon=canonical_host(target.host)
+            if target.port in ALT_HTTP_PORTS and canon in hosts_with_primary_http:
+                return False
             row_entries.append({"target":target,"fragment":fragment_idx})
-            key=(canonical_host(target.host),target.scheme,target.port,normalize_path(target.path))
+            key=(canon,target.scheme,target.port,normalize_path(target.path))
             if key not in aggregate_seen:
                 aggregate.append(target)
                 aggregate_seen.add(key)
+            return True
 
         if hosts and http_ports:
+            sorted_ports=sorted(http_ports,key=lambda p:(0 if p in PRIMARY_HTTP_PORTS else 1,p))
             for host in hosts:
-                for port in http_ports:
+                if not host:
+                    continue
+                canon_host=canonical_host(host)
+                if canon_host in skip_www_hosts:
+                    continue
+                for port in sorted_ports:
+                    if port in ALT_HTTP_PORTS and canon_host in hosts_with_primary_http:
+                        continue
                     scheme=port_scheme(port)
                     target=Target(host=host,port=port,scheme=scheme,path="/")
                     frag_idx=find_fragment_index(
                         fragments,
-                        canonical_host(host),
+                        canon_host,
                         "/",
                         scheme,
                         port,
                         target_to_url(target)
                     )
-                    add_entry(target,frag_idx)
+                    added=add_entry(target,frag_idx,"port")
+                    if added and port in PRIMARY_HTTP_PORTS:
+                        hosts_with_primary_http.add(canon_host)
 
         fuzz_targets=extract_fuzz_targets(fragments,known_hosts)
         for tgt,idx in fuzz_targets:
-            add_entry(tgt,idx)
+            add_entry(tgt,idx,"fuzz")
 
         redirect_targets=extract_redirect_targets(fragments,known_hosts)
         for tgt,idx in redirect_targets:
-            add_entry(tgt,idx)
+            add_entry(tgt,idx,"redirect")
 
         per_row.append(row_entries)
     return per_row,aggregate
@@ -888,22 +913,16 @@ def write_csv_output(rows:List[Dict[str,str]],path:str) -> None:
     print(f"[+] Wrote: {path}")
 
 def render_shot_block(entry:Dict[str,str],base:str,dns:str,f) -> None:
+    thumb_path=entry.get("thumb") or entry.get("path")
+    if not thumb_path or not os.path.exists(thumb_path):
+        return
     label_text=entry.get("label","")
     f.write("<div class=\"shot-block\">")
     if label_text:
         f.write(f"<div class=\"shot-label\">{html.escape(label_text)}</div>")
-    thumb_path=entry.get("thumb") or entry.get("path")
-    status=entry.get("status","")
-    title=entry.get("title","")
-    if thumb_path and os.path.exists(thumb_path):
-        rel=os.path.relpath(thumb_path,base)
-        rel_html=html.escape(rel)
-        f.write(f"<img src=\"{rel_html}\" alt=\"{dns}\" style=\"width:2in;height:auto;\" width=\"192\">")
-    elif status:
-        detail=f" - {title}" if title and title.lower()!=status.lower() else ""
-        f.write(f"<div class=\"shot-error\">{html.escape(status+detail)}</div>")
-    else:
-        f.write("<div class=\"shot-pending\">(pending)</div>")
+    rel=os.path.relpath(thumb_path,base)
+    rel_html=html.escape(rel)
+    f.write(f"<img src=\"{rel_html}\" alt=\"{dns}\" style=\"width:2in;height:auto;\" width=\"192\">")
     f.write("</div>")
 
 def write_html_output(rows:List[Dict[str,str]],path:str) -> None:
@@ -943,7 +962,8 @@ def write_html_output(rows:List[Dict[str,str]],path:str) -> None:
             shots=row.get("_targets") or []
             if not shots:
                 if note_text:
-                    f.write(f"<td><div class=\"note-text\">{html.escape(note_text)}</div></td>")
+                    cleaned=sanitize_fuzzing_text(note_text)
+                    f.write(f"<td><div class=\"note-text\">{html.escape(cleaned)}</div></td>")
                 else:
                     f.write("<td></td>")
             else:
@@ -953,12 +973,14 @@ def write_html_output(rows:List[Dict[str,str]],path:str) -> None:
                 extras=row.get("_extra_shots") or []
                 if note_frags:
                     for idx,frag in enumerate(note_frags):
-                        f.write(f"<div class=\"note-entry\">{html.escape(frag)}")
+                        display_frag=sanitize_fuzzing_text(frag)
+                        f.write(f"<div class=\"note-entry\">{html.escape(display_frag)}")
                         for entry in frag_map.get(idx,[]):
                             render_shot_block(entry,base,dns,f)
                         f.write("</div>")
                 elif note_text:
-                    f.write(f"<div class=\"note-entry\">{html.escape(note_text)}</div>")
+                    cleaned=sanitize_fuzzing_text(note_text)
+                    f.write(f"<div class=\"note-entry\">{html.escape(cleaned)}</div>")
                 if extras:
                     f.write("<div class=\"note-entry\">")
                     for entry in extras:
