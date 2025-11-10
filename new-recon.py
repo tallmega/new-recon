@@ -93,6 +93,23 @@ def process_input_file(path):
             s.update(expand_cidr(l) if '/' in l else [l])
     return s
 
+def process_fqdn_file(path):
+    hosts=set()
+    with open(path) as f:
+        for line in f:
+            line=line.strip()
+            if not line:
+                continue
+            for token in re.split(r"[,\s]+",line):
+                token=token.strip()
+                if token:
+                    hosts.add(token)
+    return sorted(hosts)
+
+def safe_name(name):
+    cleaned=re.sub(r'[^A-Za-z0-9._-]+','_',name.strip())
+    return cleaned or "custom"
+
 def is_ip(v):
     try: ipaddress.ip_address(v); return True
     except: return False
@@ -409,6 +426,20 @@ def enumerate_domain(domain,input_ips,scan_all=False,prefer_input_ip=False,
             results[ip_str].append({'dns':s,'ports':set(),'nuclei':'','excluded':False})
     return results
 
+def add_direct_fqdns(hosts,results,scan_all,input_ips,prefer_input_ip):
+    added=0
+    for host in hosts:
+        ips=choose_ips_for_fqdn(host,scan_all,input_ips,prefer_input_ip)
+        if not ips:
+            print(f"[!] Unable to resolve {host}; skipping")
+            continue
+        for ip in ips:
+            ip_str=str(ip)
+            results[ip_str].append({'dns':host,'ports':set(),'nuclei':'','excluded':False})
+            added+=1
+    if added:
+        print(f"[i] Added {added} host-to-IP mappings from --fqdns list")
+
 def merge_results(dest,src):
     for ip,recs in src.items():
         dest[ip].extend(recs)
@@ -434,26 +465,14 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
             with ThreadPoolExecutor(max_workers=nmap_workers) as executor:
                 future_map={executor.submit(scan_ports,ip,False,nmap_top_ports,nmap_timeout,nmap_extra):ip
                             for ip in target_ips}
-                completed=as_completed(future_map)
-                if _HAS_ALIVE:
-                    with alive_bar(total_targets,title="nmap scans",enrich_print=False) as bar:
-                        for fut in completed:
-                            ip=future_map[fut]
-                            try:
-                                scanres[ip]=fut.result()
-                            except Exception as exc:
-                                print(f"[!] nmap error for {ip}: {exc}")
-                                scanres[ip]='N/A'
-                            bar()
-                else:
-                    for fut in completed:
-                        ip=future_map[fut]
-                        print(f"[i] nmap target {ip}")
-                        try:
-                            scanres[ip]=fut.result()
-                        except Exception as exc:
-                            print(f"[!] nmap error for {ip}: {exc}")
-                            scanres[ip]='N/A'
+                for fut in as_completed(future_map):
+                    ip=future_map[fut]
+                    print(f"[i] nmap target {ip}")
+                    try:
+                        scanres[ip]=fut.result()
+                    except Exception as exc:
+                        print(f"[!] nmap error for {ip}: {exc}")
+                        scanres[ip]='N/A'
         else:
             ip=target_ips[0]
             print(f"[i] nmap target {ip}")
@@ -532,58 +551,32 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
         print(f"[i] Nuclei queued {len(nuclei_tasks)} targets "
               f"(cache hits {cache_hits}, non-http skipped {non_http_skips}, dedup {dedup_skips})")
         if workers<=1:
-            if _HAS_ALIVE:
-                with alive_bar(len(nuclei_tasks),title="nuclei scans",enrich_print=False) as bar:
-                    for key,ip,port,host_header,recs in nuclei_tasks:
-                        res=run_nuclei(ip,port,host_header)
-                        NUCLEI_CACHE[key]=res
-                        if res:
-                            for r in recs:
-                                r['nuclei']=res
-                        bar()
-            else:
-                for key,ip,port,host_header,recs in nuclei_tasks:
-                    print(f"[i] nuclei target {ip}:{port} (host {host_header or '-'})")
-                    res=run_nuclei(ip,port,host_header)
-                    NUCLEI_CACHE[key]=res
-                    if res:
-                        for r in recs:
-                            r['nuclei']=res
+            for key,ip,port,host_header,recs in nuclei_tasks:
+                print(f"[i] nuclei target {ip}:{port} (host {host_header or '-'})")
+                res=run_nuclei(ip,port,host_header)
+                NUCLEI_CACHE[key]=res
+                if res:
+                    for r in recs:
+                        r['nuclei']=res
         else:
             print(f"[i] Running nuclei with {workers} worker threads")
-            progress_ctx=(alive_bar(len(nuclei_tasks),title="nuclei scans",enrich_print=False) if _HAS_ALIVE else None)
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_map={}
                 for key,ip,port,host_header,recs in nuclei_tasks:
                     future=executor.submit(run_nuclei,ip,port,host_header)
                     future_map[future]=(key,recs)
                 iterator=as_completed(future_map)
-                if progress_ctx:
-                    with progress_ctx as bar:
-                        for fut in iterator:
-                            key,recs=future_map[fut]
-                            try:
-                                res=fut.result()
-                            except Exception as exc:
-                                print(f"[!] nuclei error on {key[0]}:{key[1]} - {exc}")
-                                res=''
-                            NUCLEI_CACHE[key]=res
-                            if res:
-                                for r in recs:
-                                    r['nuclei']=res
-                            bar()
-                else:
-                    for fut in iterator:
-                        key,recs=future_map[fut]
-                        try:
-                            res=fut.result()
-                        except Exception as exc:
-                            print(f"[!] nuclei error on {key[0]}:{key[1]} - {exc}")
-                            res=''
-                        NUCLEI_CACHE[key]=res
-                        if res:
-                            for r in recs:
-                                r['nuclei']=res
+                for fut in iterator:
+                    key,recs=future_map[fut]
+                    try:
+                        res=fut.result()
+                    except Exception as exc:
+                        print(f"[!] nuclei error on {key[0]}:{key[1]} - {exc}")
+                        res=''
+                    NUCLEI_CACHE[key]=res
+                    if res:
+                        for r in recs:
+                            r['nuclei']=res
     else:
         total_candidates=cache_hits+non_http_skips+dedup_skips
         if cache_hits:
@@ -596,8 +589,9 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
 # ---------- main ----------
 if __name__=="__main__":
     p=argparse.ArgumentParser()
-    p.add_argument("domains",nargs="+")
+    p.add_argument("domains",nargs="*",help="Domains to enumerate (optional when --fqdns or --input is supplied)")
     p.add_argument("-i","--input")
+    p.add_argument("--fqdns",help="File containing explicit FQDNs/hosts to scan (one per line)")
     p.add_argument("--skip-scans",action="store_true")
     p.add_argument("--exclude-file",help="File containing IPs to exclude from scanning")
     p.add_argument("--scan-all-ips-per-fqdn",action="store_true")
@@ -626,6 +620,10 @@ if __name__=="__main__":
     a=p.parse_args()
 
     ips=process_input_file(a.input) if a.input else set()
+    fqdn_list=process_fqdn_file(a.fqdns) if a.fqdns else []
+    if not a.domains and not fqdn_list and not ips:
+        print("[!] Please supply at least one domain, --fqdns file, or --input file.")
+        sys.exit(1)
     exclude_list=process_input_file(a.exclude_file) if a.exclude_file else set()
     exclude_ips={str(ip) for ip in exclude_list if is_ip(ip)}
     chosen_resolvers=[]
@@ -643,19 +641,23 @@ if __name__=="__main__":
         for ip in sorted(exclude_ips,key=ip_sort_key):
             print(f"    - {ip}")
     total_domains=len(a.domains)
-    for idx,d in enumerate(a.domains):
-        enum_res=enumerate_domain(d,ips,
-                                  scan_all=a.scan_all_ips_per_fqdn,
-                                  prefer_input_ip=a.prefer_input_ip,
-                                  resolvers=chosen_resolvers or None,
-                                  apply_wildcard_filter=not a.no_wildcard_filter,
-                                  gobuster_wordlist=a.gobuster_wordlist,
-                                  gobuster_threads=a.gobuster_threads,
-                                  use_gobuster=not a.skip_gobuster)
-        merge_results(allres,enum_res)
-        if a.domain_delay>0 and total_domains>1 and idx<total_domains-1:
-            print(f"[i] Waiting {a.domain_delay:.1f}s before next domain to ease DNS load")
-            time.sleep(a.domain_delay)
+    if total_domains:
+        for idx,d in enumerate(a.domains):
+            enum_res=enumerate_domain(d,ips,
+                                      scan_all=a.scan_all_ips_per_fqdn,
+                                      prefer_input_ip=a.prefer_input_ip,
+                                      resolvers=chosen_resolvers or None,
+                                      apply_wildcard_filter=not a.no_wildcard_filter,
+                                      gobuster_wordlist=a.gobuster_wordlist,
+                                      gobuster_threads=a.gobuster_threads,
+                                      use_gobuster=not a.skip_gobuster)
+            merge_results(allres,enum_res)
+            if a.domain_delay>0 and total_domains>1 and idx<total_domains-1:
+                print(f"[i] Waiting {a.domain_delay:.1f}s before next domain to ease DNS load")
+                time.sleep(a.domain_delay)
+    if fqdn_list:
+        print(f"[i] Using {len(fqdn_list)} hostnames from --fqdns (no brute-force enumeration).")
+        add_direct_fqdns(fqdn_list,allres,a.scan_all_ips_per_fqdn,ips,a.prefer_input_ip)
     ensure_input_ips(allres,explicit_ips,exclude_ips)
     run_scans(allres,a.skip_scans,explicit_ips,exclude_ips,
               nmap_top_ports=a.nmap_top_ports,
@@ -663,5 +665,13 @@ if __name__=="__main__":
               nuclei_single_web_port=a.nuclei_single_web_port,
               nuclei_workers=a.nuclei_workers,
               nmap_workers=a.nmap_workers)
-    outfile=f"new-recon-{a.domains[0]}_output.csv"
+    if a.domains:
+        outfile_base=a.domains[0]
+    elif fqdn_list:
+        outfile_base=fqdn_list[0]
+    elif explicit_ips:
+        outfile_base=sorted(explicit_ips,key=ip_sort_key)[0]
+    else:
+        outfile_base="custom"
+    outfile=f"new-recon-{safe_name(outfile_base)}_output.csv"
     write_csv(outfile,allres)

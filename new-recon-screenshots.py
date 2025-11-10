@@ -898,7 +898,7 @@ def render_shot_block(entry:Dict[str,str],base:str,dns:str,f) -> None:
     if thumb_path and os.path.exists(thumb_path):
         rel=os.path.relpath(thumb_path,base)
         rel_html=html.escape(rel)
-        f.write(f"<img src=\"{rel_html}\" alt=\"{dns}\">")
+        f.write(f"<img src=\"{rel_html}\" alt=\"{dns}\" style=\"width:2in;height:auto;\" width=\"192\">")
     elif status:
         detail=f" - {title}" if title and title.lower()!=status.lower() else ""
         f.write(f"<div class=\"shot-error\">{html.escape(status+detail)}</div>")
@@ -914,12 +914,12 @@ def write_html_output(rows:List[Dict[str,str]],path:str) -> None:
         f.write(
             "<style>"
             "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
-            "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;}"
+            "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;table-layout:fixed;}"
             "th,td{border:1px solid #000;padding:8px 10px;vertical-align:top;font-size:9pt;}"
             "th{background:#000;color:#ffd400;font-weight:bold;}"
             "tbody tr:nth-child(odd) td{background:#f7f7f7;}"
             "tbody tr:nth-child(even) td{background:#ededed;}"
-            "td img{max-width:20%;height:auto;border:1px solid #888;margin:6px auto;display:block;}"
+            "td img{width:2in !important;max-width:none !important;max-height:none !important;border:1px solid #888;margin:6px auto;display:block;}"
             ".shot-block{margin:0 auto 12px auto;text-align:center;border:1px solid #ccc;padding:6px;background:#fff;}"
             ".shot-label{font-weight:bold;font-size:8pt;margin-bottom:4px;word-break:break-all;}"
             ".shot-pending{font-style:italic;color:#666;}"
