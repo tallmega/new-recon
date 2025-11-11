@@ -14,7 +14,7 @@ import argparse, csv, html, json, os, re, shutil, subprocess, sys
 from urllib.parse import urlparse
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
     _HAS_PIL=True
 except ImportError:
     _HAS_PIL=False
@@ -35,6 +35,7 @@ PRIMARY_HTTP_PORTS={80,443}
 ALT_HTTP_PORTS={8080,8443,8880,8008,8015}
 
 IMAGE_EXTS=(".png",".jpg",".jpeg",".webp",".bmp",".gif")
+_BORDER_CACHE={}
 BASE_COLS=["DNS","IP / Hosting Provider","Ports","Nuclei"]
 NOTES_COL="Notes"
 IPV4_RE=re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
@@ -193,6 +194,56 @@ def sanitize_fuzzing_text(text:str) -> str:
     if not text:
         return ""
     return FUZZ_NO_MATCH_RE.sub("Fuzzing Results - no matches",text)
+
+def ensure_bordered_image(path:str) -> str:
+    if not path or not _HAS_PIL or not os.path.isfile(path):
+        return path
+    cached=_BORDER_CACHE.get(path)
+    if cached and os.path.isfile(cached):
+        return cached
+    root,ext=os.path.splitext(path)
+    bordered_path=f"{root}_border{ext}"
+    try:
+        with Image.open(path) as img:
+            mode=img.mode
+            if mode not in {"RGB","RGBA"}:
+                img=img.convert("RGB")
+            fill_color=(160,160,160,255) if img.mode=="RGBA" else (160,160,160)
+            bordered=ImageOps.expand(img,border=1,fill=fill_color)
+            bordered.save(bordered_path)
+    except Exception:
+        return path
+    _BORDER_CACHE[path]=bordered_path
+    return bordered_path
+
+
+def _annotate_redirect_notes(fragments:List[str]) -> List[str]:
+    annotated=[]
+    for frag in fragments:
+        def _replace(match):
+            src=match.group(1).strip()
+            dest_raw=match.group(2)
+            base=_parse_label_url(src)
+            if not base:
+                return match.group(0)
+            dest_url=_resolve_destination(dest_raw,base)
+            if not dest_url:
+                return match.group(0)
+            dest_clean=dest_raw.lstrip()
+            leading=dest_raw[:len(dest_raw)-len(dest_clean)]
+            m_span=re.match(r"(\S+)(.*)",dest_clean)
+            if not m_span:
+                return match.group(0)
+            dest_token=m_span.group(1)
+            if dest_token.lower().startswith(("http://","https://")):
+                return match.group(0)
+            dest_suffix=m_span.group(2)
+            new_dest=f"{leading}{dest_url}{dest_suffix}"
+            return f"{match.group(1)} -> {new_dest}"
+        new_frag=NOTE_REDIRECT_RE.sub(_replace,frag)
+        annotated.append(new_frag)
+    return annotated
+
 
 def _normalize_url_for_match(url:str) -> str:
     return url.lower().rstrip("/")
@@ -391,12 +442,14 @@ def extract_fuzz_targets(fragments:List[str],known_hosts:Set[str]) -> List[Tuple
             continue
     return urls
 
-def extract_redirect_targets(fragments:List[str],known_hosts:Set[str]) -> List[Tuple[Target,int]]:
+def extract_redirect_targets(fragments:List[str],known_hosts:Set[str]) -> Tuple[List[Tuple[Target,int]],Set[Tuple[str,str]]]:
     urls=[]
+    suppress_bases=set()
     for idx,frag in enumerate(fragments):
         for match in NOTE_REDIRECT_RE.finditer(frag):
             src=match.group(1).strip()
-            dest=match.group(2).split(",")[0].strip()
+            dest_fragment=match.group(2).strip()
+            dest=dest_fragment.split(",")[0].strip()
             base=_parse_label_url(src)
             if not base:
                 continue
@@ -409,14 +462,20 @@ def extract_redirect_targets(fragments:List[str],known_hosts:Set[str]) -> List[T
                 chost=canonical_host(parsed.hostname or "")
                 if known_hosts and chost not in known_hosts:
                     continue
-                url_scheme=parsed.scheme or scheme
+                url_scheme=(parsed.scheme or scheme).lower()
                 url_host=parsed.hostname or host
                 url_port=parsed.port or (443 if url_scheme=="https" else 80)
-                url_path=parsed.path or "/"
+                url_path=normalize_path(parsed.path or "/")
+                src_canon=canonical_host(host)
+                dest_canon=canonical_host(url_host)
+                if dest_canon==src_canon:
+                    suppress_bases.add((src_canon, scheme.lower()))
+                    if url_scheme==scheme.lower() and url_path=="/":
+                        continue
                 urls.append((Target(host=url_host,port=url_port,scheme=url_scheme,path=url_path),idx))
             except Exception:
                 continue
-    return urls
+    return urls,suppress_bases
 
 def build_targets(rows:List[Dict[str,str]],max_hosts:int,only_interesting:bool) -> Tuple[List[List[Dict[str,object]]],List[Target]]:
     per_row=[]
@@ -440,21 +499,48 @@ def build_targets(rows:List[Dict[str,str]],max_hosts:int,only_interesting:bool) 
         if provider_ip:
             known_hosts.add(canonical_host(provider_ip))
         row_entries=[]
+        row_seen=set()
+        row_seen_paths=set()
+        row_seen=set()
         hosts_with_primary_http=set()
+        suppress_bases=set()
+        redirect_targets,suppress_entries=extract_redirect_targets(fragments,known_hosts)
+        suppress_bases.update(suppress_entries)
 
         def add_entry(target:Target,fragment_idx:Optional[int],source:str="port")->bool:
             canon=canonical_host(target.host)
+            scheme_lower=target.scheme.lower()
+            norm_path=normalize_path(target.path or "/")
+            if source=="port" and (canon,scheme_lower) in suppress_bases and normalize_path(target.path or "/")=="/":
+                if target.port in PRIMARY_HTTP_PORTS:
+                    hosts_with_primary_http.add(canon)
+                return False
             if target.port in ALT_HTTP_PORTS and canon in hosts_with_primary_http:
                 return False
+            if scheme_lower=="http" and (canon,norm_path,"https") in row_seen_paths:
+                return False
+            key=(canon,target.scheme,target.port,norm_path)
+            if key in row_seen:
+                return False
             row_entries.append({"target":target,"fragment":fragment_idx})
-            key=(canon,target.scheme,target.port,normalize_path(target.path))
+            row_seen.add(key)
+            row_seen_paths.add((canon,norm_path,scheme_lower))
             if key not in aggregate_seen:
                 aggregate.append(target)
                 aggregate_seen.add(key)
             return True
 
+        def _port_sort_key(p:int):
+            if p==443:
+                return (0,0)
+            if p==80:
+                return (0,1)
+            if p in PRIMARY_HTTP_PORTS:
+                return (0,2)
+            return (1,p)
+
         if hosts and http_ports:
-            sorted_ports=sorted(http_ports,key=lambda p:(0 if p in PRIMARY_HTTP_PORTS else 1,p))
+            sorted_ports=sorted(http_ports,key=_port_sort_key)
             for host in hosts:
                 if not host:
                     continue
@@ -482,7 +568,6 @@ def build_targets(rows:List[Dict[str,str]],max_hosts:int,only_interesting:bool) 
         for tgt,idx in fuzz_targets:
             add_entry(tgt,idx,"fuzz")
 
-        redirect_targets=extract_redirect_targets(fragments,known_hosts)
         for tgt,idx in redirect_targets:
             add_entry(tgt,idx,"redirect")
 
@@ -829,6 +914,7 @@ def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,obje
         }
         fragments_summary=[]
         note_fragments=_split_note_fragments(new_row["notes_text"])
+        note_fragments=_annotate_redirect_notes(note_fragments)
         fragment_map={i:[] for i in range(len(note_fragments))}
         leftovers=[]
 
@@ -916,11 +1002,12 @@ def render_shot_block(entry:Dict[str,str],base:str,dns:str,f) -> None:
     thumb_path=entry.get("thumb") or entry.get("path")
     if not thumb_path or not os.path.exists(thumb_path):
         return
+    display_path=ensure_bordered_image(thumb_path)
     label_text=entry.get("label","")
     f.write("<div class=\"shot-block\">")
     if label_text:
         f.write(f"<div class=\"shot-label\">{html.escape(label_text)}</div>")
-    rel=os.path.relpath(thumb_path,base)
+    rel=os.path.relpath(display_path,base) if display_path else os.path.relpath(thumb_path,base)
     rel_html=html.escape(rel)
     f.write(f"<img src=\"{rel_html}\" alt=\"{dns}\" style=\"width:2in;height:auto;\" width=\"192\">")
     f.write("</div>")

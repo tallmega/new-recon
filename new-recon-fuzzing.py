@@ -232,6 +232,14 @@ def describe_target_host(host: str, scheme: str, port: int) -> str:
     return host
 
 
+def build_base_url(host: str, scheme: str, port: int) -> str:
+    default_port = 443 if scheme == "https" else 80
+    host_part = host_for_url(host)
+    if port and port != default_port:
+        return f"{scheme}://{host_part}:{port}"
+    return f"{scheme}://{host_part}"
+
+
 def collect_known_hosts(rows: Sequence[Dict[str, str]]) -> Set[str]:
     known: Set[str] = set()
     for row in rows:
@@ -296,6 +304,8 @@ def detect_hosts_in_notes(notes: str, row_hosts_lower: Dict[str, str]) -> Set[st
         if not STATUS_PATTERN.search(frag):
             continue
         matched: Set[str] = set()
+        frag_lower = frag.lower()
+        has_plus_more = bool(re.search(r"\+\s*\d+\s+more", frag_lower))
         colon_split = frag.split(":", 1)
         head = colon_split[0] if len(colon_split) == 2 else frag
         for token in HOST_TOKEN_RE.findall(head):
@@ -305,10 +315,11 @@ def detect_hosts_in_notes(notes: str, row_hosts_lower: Dict[str, str]) -> Set[st
                 matched.add(row_hosts_lower[norm])
         # fallback: if no host token matched, but fragment mentions a host substring
         if not matched:
-            frag_lower = frag.lower()
             for norm, original in row_hosts_lower.items():
                 if norm in frag_lower:
                     matched.add(original)
+        if has_plus_more:
+            matched.update(row_hosts_lower.values())
         hosts.update(matched)
     return hosts
 
@@ -392,16 +403,17 @@ def normalize_path(path: str) -> str:
     return path
 
 
-def _parse_redirect_target(redirect: str, base_host: str) -> Tuple[str, str]:
+def _parse_redirect_target(redirect: str, base_host: str, base_scheme: str) -> Tuple[str, str, str]:
     if not redirect:
-        return base_host, "/"
+        return base_scheme, base_host, "/"
     if redirect.startswith("//"):
         parsed = urlparse("https:" + redirect)
     elif "://" in redirect:
         parsed = urlparse(redirect)
     else:
         path = normalize_path(redirect)
-        parsed = urlparse(f"https://{base_host}{path}")
+        parsed = urlparse(f"{base_scheme}://{base_host}{path}")
+    dest_scheme = parsed.scheme or base_scheme
     dest_host = parsed.netloc or base_host
     if "@" in dest_host:
         dest_host = dest_host.split("@", 1)[-1]
@@ -409,12 +421,13 @@ def _parse_redirect_target(redirect: str, base_host: str) -> Tuple[str, str]:
     dest_path = parsed.path or "/"
     if parsed.query:
         dest_path = dest_path.split("?", 1)[0]
-    return dest_host or base_host, normalize_path(dest_path)
+    return dest_scheme.lower(), dest_host or base_host, normalize_path(dest_path)
 
 
 def analyze_ffuf_results(
     data: Dict,
     base_host: str,
+    base_scheme: str,
     known_hosts: Set[str],
     baseline_status: Optional[int],
     max_results_per_status: int,
@@ -443,10 +456,16 @@ def analyze_ffuf_results(
             status_by_path.setdefault(path, status)
             continue
         if status in (301, 302):
-            dest_host, dest_path = _parse_redirect_target(redirect, base_host)
+            dest_scheme, dest_host, dest_path = _parse_redirect_target(redirect, base_host, base_scheme)
             dest_host_norm = normalize_host(dest_host)
-            label = dest_path if dest_host_norm == base_norm else f"{dest_host}{dest_path}"
+            same_host = dest_host_norm == base_norm
+            same_scheme = dest_scheme == base_scheme.lower()
+            if same_host and same_scheme:
+                label = dest_path
+            else:
+                label = f"{dest_scheme}://{dest_host}{dest_path}"
             redirect_counter[label] += 1
+            status_by_path.setdefault(label, status)
             if dest_host_norm != base_norm and dest_host_norm not in known_hosts:
                 out_of_scope.add(dest_host)
             continue
@@ -471,7 +490,7 @@ def analyze_ffuf_results(
     )
 
 
-def format_findings(label: str, finding: FfufFinding) -> str:
+def format_findings(base_url: str, finding: FfufFinding) -> str:
     parts: List[str] = []
     if finding.top_redirect:
         status_suffix = f" [{finding.top_redirect_status}]" if finding.top_redirect_status else ""
@@ -485,8 +504,8 @@ def format_findings(label: str, finding: FfufFinding) -> str:
         oos = ", ".join(sorted(finding.out_of_scope_hosts))
         parts.append(f"oos -> {oos}")
     if not parts:
-        return f"Fuzzing Results - {label}: no ffuf matches"
-    return f"Fuzzing Results - {label}: " + " ; ".join(parts)
+        return f"Fuzzing Results - {base_url}: no matches"
+    return f"Fuzzing Results - {base_url}: " + " ; ".join(parts)
 
 
 def append_notes(original: str, addition: str) -> str:
@@ -534,12 +553,13 @@ def main() -> None:
         finding = analyze_ffuf_results(
             ffuf_data,
             target.host,
+            target.scheme,
             known_hosts,
             target.baseline_status,
             args.max_results_per_status,
         )
-        target_label = describe_target_host(target.host, target.scheme, target.port)
-        summary = format_findings(target_label, finding)
+        base_url = build_base_url(target.host, target.scheme, target.port)
+        summary = format_findings(base_url, finding)
         for row_idx in target.row_indexes:
             additions_per_row[row_idx].append(summary)
     if args.dry_run:
@@ -548,7 +568,8 @@ def main() -> None:
     for idx, additions in additions_per_row.items():
         if not additions:
             continue
-        combined = " | ".join(additions)
+        unique_additions=list(dict.fromkeys(additions))
+        combined = " | ".join(unique_additions)
         rows[idx]["Notes"] = append_notes(rows[idx].get("Notes", ""), combined)
     output_path = derive_output_path(args.input_csv, args.output_csv)
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
