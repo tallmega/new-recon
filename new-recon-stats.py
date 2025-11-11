@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import ipaddress
 import os
 import re
 import sys
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
@@ -27,6 +29,66 @@ HOSTNAME_TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9\-.]{1,252}$")
 IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 IPV6_RE = re.compile(r"\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+HTML_STYLE_BLOCK = (
+    "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
+    "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;table-layout:fixed;}"
+    "th,td{border:1px solid #000;padding:8px 10px;vertical-align:top;font-size:9pt;}"
+    "th{background:#000;color:#ffd400;font-weight:bold;}"
+    "tbody tr:nth-child(odd) td{background:#f7f7f7;}"
+    "tbody tr:nth-child(even) td{background:#ededed;}"
+    "td img{width:2in !important;max-width:none !important;max-height:none !important;border:1px solid #888;margin:6px auto;display:block;}"
+    ".shot-block{margin:0 auto 12px auto;text-align:center;border:1px solid #ccc;padding:6px;background:#fff;}"
+    ".shot-label{font-weight:bold;font-size:8pt;margin-bottom:4px;word-break:break-all;}"
+    ".shot-pending{font-style:italic;color:#666;}"
+    ".shot-error{color:#a00;font-weight:bold;margin:4px 0;}"
+    ".col-ip{width:20%;}"
+    ".col-port{width:10%;}"
+    ".note-text{margin-bottom:10px;font-style:italic;text-align:left;}"
+    ".note-entry{margin-bottom:12px;}"
+    ".report-section{margin-bottom:40px;}"
+    ".report-section h2{border-bottom:2px solid #000;padding-bottom:4px;margin-bottom:12px;}"
+    ".stats-list{list-style-type:disc;margin-left:20px;}"
+)
+
+
+def derive_output_html_path(sample_input: str, provided: Optional[str]) -> str:
+    if provided:
+        return provided
+    path = Path(sample_input)
+    name = path.name
+    if name.endswith("_output.csv"):
+        return str(path.with_name(name.replace("_output.csv", "_output.html")))
+    return str(path.with_suffix(path.suffix + ".html"))
+
+
+def _ensure_html_shell(path: str) -> None:
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            f"<style>{HTML_STYLE_BLOCK}</style>\n"
+            "</head>\n<body>\n</body>\n</html>\n"
+        )
+
+
+def append_html_section(path: str, title: str, inner_html: str) -> None:
+    _ensure_html_shell(path)
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    section = (
+        f"<section class=\"report-section\">\n<h2>{html.escape(title)}</h2>\n"
+        f"{inner_html}\n" "</section>\n"
+    )
+    marker = "</body>"
+    if marker in content:
+        new_content = content.replace(marker, section + marker, 1)
+    else:
+        new_content = content + section
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
 
 
 def _lower_list(values: Sequence[str]) -> List[str]:
@@ -575,6 +637,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-services", type=int, default=6, help="How many software hits to list (default 6).")
     parser.add_argument("--top-ports", type=int, default=5, help="How many ports to highlight (default 5).")
     parser.add_argument("--top-third-party", type=int, default=5, help="How many third-party services to mention (default 5).")
+    parser.add_argument("--output-html", help="Aggregated HTML report path (default: derive _output.html).")
     return parser.parse_args()
 
 
@@ -591,6 +654,11 @@ def main() -> None:
     print("\nKey stats:")
     for line in summary_lines:
         print(f" - {line}")
+
+    output_html = derive_output_html_path(args.inputs[0], args.output_html)
+    html_items = "".join(f"<li>{html.escape(line)}</li>" for line in summary_lines)
+    append_html_section(output_html, "Recon Stats", f"<ul class='stats-list'>{html_items}</ul>")
+    print(f"[+] Appended stats summary to {output_html}")
 
 if __name__ == "__main__":
     main()

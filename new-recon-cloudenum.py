@@ -2,13 +2,16 @@
 """Utility helpers for summarizing new-recon output CSVs and cloud hunting."""
 import argparse
 import csv
+import html
 import os
 import re
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from threading import Lock
+from typing import Optional
 try:
     from alive_progress import alive_bar
     HAS_ALIVE=True
@@ -23,7 +26,7 @@ GENERIC_SUFFIXES=[
     "dev","development","stage","staging","test","testing","internal","intranet","net","web"
 ]
 GENERIC_PREFIXES={"the","my","app","portal","service"}
-MUTATIONS_FILE="/usr/lib/cloud-enum/enum_tools/fuzz.txt"
+MUTATIONS_FILE="./wordlists/fuzz.txt"
 BASE_LIMIT=3
 ROOT_LIMIT=2
 CATEGORY_LABELS={
@@ -44,6 +47,62 @@ CATEGORY_LABELS={
     "netlify-bucket-enum":"Netlify Bucket",
     "backblaze-b2-bucket-enum":"Backblaze B2",
 }
+
+HTML_STYLE_BLOCK=(
+    "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
+    "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;table-layout:fixed;}"
+    "th,td{border:1px solid #000;padding:8px 10px;vertical-align:top;font-size:9pt;}"
+    "th{background:#000;color:#ffd400;font-weight:bold;}"
+    "tbody tr:nth-child(odd) td{background:#f7f7f7;}"
+    "tbody tr:nth-child(even) td{background:#ededed;}"
+    "td img{width:2in !important;max-width:none !important;max-height:none !important;border:1px solid #888;margin:6px auto;display:block;}"
+    ".shot-block{margin:0 auto 12px auto;text-align:center;border:1px solid #ccc;padding:6px;background:#fff;}"
+    ".shot-label{font-weight:bold;font-size:8pt;margin-bottom:4px;word-break:break-all;}"
+    ".shot-pending{font-style:italic;color:#666;}"
+    ".shot-error{color:#a00;font-weight:bold;margin:4px 0;}"
+    ".col-ip{width:20%;}"
+    ".col-port{width:10%;}"
+    ".note-text{margin-bottom:10px;font-style:italic;text-align:left;}"
+    ".note-entry{margin-bottom:12px;}"
+    ".report-section{margin-bottom:40px;}"
+    ".report-section h2{border-bottom:2px solid #000;padding-bottom:4px;margin-bottom:12px;}"
+)
+
+
+def derive_output_html_path(csv_path: str, provided: Optional[str]) -> str:
+    if provided:
+        return provided
+    path=Path(csv_path)
+    name=path.name
+    if name.endswith("_output.csv"):
+        return str(path.with_name(name.replace("_output.csv","_output.html")))
+    return str(path.with_suffix(path.suffix+".html"))
+
+
+def _ensure_html_shell(path: str) -> None:
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path,"w",encoding="utf-8") as f:
+        f.write(
+            "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            f"<style>{HTML_STYLE_BLOCK}</style>\n"
+            "</head>\n<body>\n</body>\n</html>\n"
+        )
+
+
+def append_html_section(path: str,title: str,inner_html: str) -> None:
+    _ensure_html_shell(path)
+    with open(path,"r",encoding="utf-8") as f:
+        content=f.read()
+    section=(f"<section class=\"report-section\">\n<h2>{html.escape(title)}</h2>\n"+inner_html+"\n</section>\n")
+    marker="</body>"
+    if marker in content:
+        content=content.replace(marker,section+marker,1)
+    else:
+        content+=section
+    with open(path,"w",encoding="utf-8") as f:
+        f.write(content)
 
 
 def extract_labels(dns_cell):
@@ -228,11 +287,12 @@ def run_cloud_enum(entries, workers=5, delay=0.1, debug=False):
 
 def main():
     parser=argparse.ArgumentParser(description="new-recon stats helper")
-    parser.add_argument("csv",help="Path to new-recon-*_output_ffuf.csv")
+    parser.add_argument("csv",help="Path to new-recon-*_output.csv")
     parser.add_argument("--top",type=int,default=10,help="How many results to display (default 10)")
     parser.add_argument("--cloud-workers",type=int,default=5,help="Parallel nuclei workers for cloud enum (default 5)")
     parser.add_argument("--cloud-delay",type=float,default=0.0,help="Delay in seconds between nuclei runs to avoid throttling (default 0.0)")
     parser.add_argument("--cloud-debug",action="store_true",help="Print nuclei commands and output for debugging")
+    parser.add_argument("--output-html",help="Aggregated HTML report path (default: derive _output.html)")
     args=parser.parse_args()
 
     base_counter=Counter()
@@ -267,6 +327,8 @@ def main():
     print(f"[i] Mutations loaded: {len(mutations)}")
     word_entries=build_names(keywords,mutations)
     findings=run_cloud_enum(word_entries,workers=args.cloud_workers,delay=args.cloud_delay,debug=args.cloud_debug)
+    output_html=derive_output_html_path(args.csv,args.output_html)
+
     if findings and any(findings.values()):
         print("\n[i] Potential Cloud Assets Discovered:")
         for category in sorted(findings.keys()):
@@ -276,6 +338,26 @@ def main():
             print()
     else:
         print("\n[i] No cloud assets discovered.")
+
+    section_parts=[]
+    top_bases_html="".join(
+        f"<li>{html.escape(label)} - {count}</li>" for label,count in base_counter.most_common(args.top)
+    )
+    if top_bases_html:
+        section_parts.append(f"<h3>Top SLDs</h3><ul>{top_bases_html}</ul>")
+    candidates_html=", ".join(html.escape(k) for k in keywords)
+    if candidates_html:
+        section_parts.append(f"<p><strong>Keywords:</strong> {candidates_html}</p>")
+    if findings and any(findings.values()):
+        finding_sections=[]
+        for category in sorted(findings.keys()):
+            urls_html="".join(f"<li>{html.escape(url)}</li>" for url in sorted(findings[category]))
+            finding_sections.append(f"<h4>{html.escape(category)}</h4><ul>{urls_html}</ul>")
+        section_parts.append("".join(finding_sections))
+    else:
+        section_parts.append("<p><em>No cloud assets discovered.</em></p>")
+    append_html_section(output_html,"Cloud Enumeration","".join(section_parts))
+    print(f"[+] Appended cloud enum summary to {output_html}")
 
 
 if __name__=="__main__":

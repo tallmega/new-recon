@@ -10,7 +10,8 @@ Workflow:
   5. Build an HTML table (and optional CSV) with screenshot links for documentation
 """
 
-import argparse, csv, html, json, os, re, shutil, subprocess, sys
+import argparse, csv, html, io, json, os, re, shutil, subprocess, sys
+from pathlib import Path
 from urllib.parse import urlparse
 
 try:
@@ -40,6 +41,62 @@ BASE_COLS=["DNS","IP / Hosting Provider","Ports","Nuclei"]
 NOTES_COL="Notes"
 IPV4_RE=re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 IPV6_RE=re.compile(r"\b([0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
+
+HTML_STYLE_BLOCK=(
+    "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
+    "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;table-layout:fixed;}"
+    "th,td{border:1px solid #000;padding:8px 10px;vertical-align:top;font-size:9pt;}"
+    "th{background:#000;color:#ffd400;font-weight:bold;}"
+    "tbody tr:nth-child(odd) td{background:#f7f7f7;}"
+    "tbody tr:nth-child(even) td{background:#ededed;}"
+    "td img{width:2in !important;max-width:none !important;max-height:none !important;border:1px solid #888;margin:6px auto;display:block;}"
+    ".shot-block{margin:0 auto 12px auto;text-align:center;border:1px solid #ccc;padding:6px;background:#fff;}"
+    ".shot-label{font-weight:bold;font-size:8pt;margin-bottom:4px;word-break:break-all;}"
+    ".shot-pending{font-style:italic;color:#666;}"
+    ".shot-error{color:#a00;font-weight:bold;margin:4px 0;}"
+    ".col-ip{width:20%;}"
+    ".col-port{width:10%;}"
+    ".note-text{margin-bottom:10px;font-style:italic;text-align:left;}"
+    ".note-entry{margin-bottom:12px;}"
+    ".report-section{margin-bottom:40px;}"
+    ".report-section h2{border-bottom:2px solid #000;padding-bottom:4px;margin-bottom:12px;}"
+)
+
+
+def derive_output_html_path(sample_input: str, provided: Optional[str]) -> str:
+    if provided:
+        return provided
+    path=Path(sample_input)
+    name=path.name
+    if name.endswith("_output.csv"):
+        return str(path.with_name(name.replace("_output.csv","_output.html")))
+    return str(path.with_suffix(path.suffix+".html"))
+
+
+def _ensure_html_shell(path: str) -> None:
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path,"w",encoding="utf-8") as f:
+        f.write(
+            "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            f"<style>{HTML_STYLE_BLOCK}</style>\n"
+            "</head>\n<body>\n</body>\n</html>\n"
+        )
+
+
+def append_html_section(path: str,title: str,inner_html: str) -> None:
+    _ensure_html_shell(path)
+    with open(path,"r",encoding="utf-8") as f:
+        content=f.read()
+    section=(f"<section class=\"report-section\">\n<h2>{html.escape(title)}</h2>\n"+inner_html+"\n</section>\n")
+    marker="</body>"
+    if marker in content:
+        content=content.replace(marker,section+marker,1)
+    else:
+        content+=section
+    with open(path,"w",encoding="utf-8") as f:
+        f.write(content)
 
 @dataclass(frozen=True)
 class Target:
@@ -998,85 +1055,64 @@ def write_csv_output(rows:List[Dict[str,str]],path:str) -> None:
             writer.writerow(row_copy)
     print(f"[+] Wrote: {path}")
 
-def render_shot_block(entry:Dict[str,str],base:str,dns:str,f) -> None:
+def render_shot_block(entry:Dict[str,str],base:str,dns:str) -> str:
     thumb_path=entry.get("thumb") or entry.get("path")
     if not thumb_path or not os.path.exists(thumb_path):
-        return
+        return ""
     display_path=ensure_bordered_image(thumb_path)
     label_text=entry.get("label","")
-    f.write("<div class=\"shot-block\">")
-    if label_text:
-        f.write(f"<div class=\"shot-label\">{html.escape(label_text)}</div>")
     rel=os.path.relpath(display_path,base) if display_path else os.path.relpath(thumb_path,base)
     rel_html=html.escape(rel)
-    f.write(f"<img src=\"{rel_html}\" alt=\"{dns}\" style=\"width:2in;height:auto;\" width=\"192\">")
-    f.write("</div>")
+    parts=["<div class=\"shot-block\">"]
+    if label_text:
+        parts.append(f"<div class=\"shot-label\">{html.escape(label_text)}</div>")
+    parts.append(f"<img src=\"{rel_html}\" alt=\"{dns}\" style=\"width:2in;height:auto;\" width=\"192\">")
+    parts.append("</div>")
+    return "".join(parts)
 
-def write_html_output(rows:List[Dict[str,str]],path:str) -> None:
-    ensure_dir(os.path.dirname(path) or ".")
+def build_html_table(rows:List[Dict[str,str]],path:str) -> str:
     base=os.path.dirname(os.path.abspath(path)) or "."
-    with open(path,"w",encoding="utf-8") as f:
-        f.write("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n")
-        f.write(
-            "<style>"
-            "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
-            "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;table-layout:fixed;}"
-            "th,td{border:1px solid #000;padding:8px 10px;vertical-align:top;font-size:9pt;}"
-            "th{background:#000;color:#ffd400;font-weight:bold;}"
-            "tbody tr:nth-child(odd) td{background:#f7f7f7;}"
-            "tbody tr:nth-child(even) td{background:#ededed;}"
-            "td img{width:2in !important;max-width:none !important;max-height:none !important;border:1px solid #888;margin:6px auto;display:block;}"
-            ".shot-block{margin:0 auto 12px auto;text-align:center;border:1px solid #ccc;padding:6px;background:#fff;}"
-            ".shot-label{font-weight:bold;font-size:8pt;margin-bottom:4px;word-break:break-all;}"
-            ".shot-pending{font-style:italic;color:#666;}"
-            ".shot-error{color:#a00;font-weight:bold;margin:4px 0;}"
-            ".col-ip{width:20%;}"
-            ".col-port{width:10%;}"
-            ".note-text{margin-bottom:10px;font-style:italic;text-align:left;}"
-            ".note-entry{margin-bottom:12px;}"
-            "</style>\n"
-        )
-        f.write("</head>\n<body>\n")
-        f.write("<table>\n<thead><tr><th>FQDN</th><th class=\"col-ip\">First Resolved IP</th><th class=\"col-port\">Ports</th><th>Notes and Screenshots</th></tr></thead>\n<tbody>\n")
-        for row in rows:
-            dns=html.escape(row.get("DNS",""))
-            resolved_ip=extract_ip(row.get("IP / Hosting Provider","")) or row.get("IP / Hosting Provider","")
-            ip=html.escape(resolved_ip)
-            ports=html.escape(row.get("Ports",""))
-            note_text=row.get("notes_text","").strip()
-            f.write("<tr>")
-            f.write(f"<td>{dns}</td><td class=\"col-ip\">{ip}</td><td class=\"col-port\">{ports}</td>")
-            shots=row.get("_targets") or []
-            if not shots:
-                if note_text:
-                    cleaned=sanitize_fuzzing_text(note_text)
-                    f.write(f"<td><div class=\"note-text\">{html.escape(cleaned)}</div></td>")
-                else:
-                    f.write("<td></td>")
+    buf=io.StringIO()
+    buf.write("<table>\n<thead><tr><th>FQDN</th><th class=\"col-ip\">First Resolved IP</th><th class=\"col-port\">Ports</th><th>Notes and Screenshots</th></tr></thead>\n<tbody>\n")
+    for row in rows:
+        dns=html.escape(row.get("DNS",""))
+        resolved_ip=extract_ip(row.get("IP / Hosting Provider","")) or row.get("IP / Hosting Provider","")
+        ip=html.escape(resolved_ip)
+        ports=html.escape(row.get("Ports",""))
+        note_text=row.get("notes_text","").strip()
+        buf.write("<tr>")
+        buf.write(f"<td>{dns}</td><td class=\"col-ip\">{ip}</td><td class=\"col-port\">{ports}</td>")
+        shots=row.get("_targets") or []
+        if not shots:
+            if note_text:
+                cleaned=sanitize_fuzzing_text(note_text)
+                buf.write(f"<td><div class=\"note-text\">{html.escape(cleaned)}</div></td>")
             else:
-                f.write("<td>")
-                note_frags=row.get("_note_fragments") or []
-                frag_map=row.get("_fragment_shots") or {}
-                extras=row.get("_extra_shots") or []
-                if note_frags:
-                    for idx,frag in enumerate(note_frags):
-                        display_frag=sanitize_fuzzing_text(frag)
-                        f.write(f"<div class=\"note-entry\">{html.escape(display_frag)}")
-                        for entry in frag_map.get(idx,[]):
-                            render_shot_block(entry,base,dns,f)
-                        f.write("</div>")
-                elif note_text:
-                    cleaned=sanitize_fuzzing_text(note_text)
-                    f.write(f"<div class=\"note-entry\">{html.escape(cleaned)}</div>")
-                if extras:
-                    f.write("<div class=\"note-entry\">")
-                    for entry in extras:
-                        render_shot_block(entry,base,dns,f)
-                    f.write("</div>")
-                f.write("</td>")
-            f.write("</tr>\n")
-        f.write("</tbody>\n</table>\n</body>\n</html>\n")
-    print(f"[+] Wrote HTML: {path}")
+                buf.write("<td></td>")
+        else:
+            buf.write("<td>")
+            note_frags=row.get("_note_fragments") or []
+            frag_map=row.get("_fragment_shots") or {}
+            extras=row.get("_extra_shots") or []
+            if note_frags:
+                for idx,frag in enumerate(note_frags):
+                    display_frag=sanitize_fuzzing_text(frag)
+                    buf.write(f"<div class=\"note-entry\">{html.escape(display_frag)}")
+                    for entry in frag_map.get(idx,[]):
+                        buf.write(render_shot_block(entry,base,dns))
+                    buf.write("</div>")
+            elif note_text:
+                cleaned=sanitize_fuzzing_text(note_text)
+                buf.write(f"<div class=\"note-entry\">{html.escape(cleaned)}</div>")
+            if extras:
+                buf.write("<div class=\"note-entry\">")
+                for entry in extras:
+                    buf.write(render_shot_block(entry,base,dns))
+                buf.write("</div>")
+            buf.write("</td>")
+        buf.write("</tr>\n")
+    buf.write("</tbody>\n</table>\n")
+    return buf.getvalue()
 
 def main():
     p=argparse.ArgumentParser(description="Generate EyeWitness HTML report from new-recon CSV data.")
@@ -1103,7 +1139,7 @@ def main():
 
     per_row_targets,all_targets=build_targets(rows,args.max_hosts_per_row,not args.include_boring)
     total=len(all_targets)
-    default_html=args.output_html or f"{os.path.splitext(args.input_csv)[0]}_screenshots.html"
+    default_html=derive_output_html_path(args.input_csv,args.output_html)
     chrome_bin=shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
     custom_dir=os.path.abspath(os.path.join(args.screenshot_dir,"custom-shots"))
     if not total:
@@ -1160,7 +1196,9 @@ def main():
                 pass
 
     updated_rows=update_rows(rows,per_row_targets,mapping,shots,thumbs,custom_dir,chrome_bin)
-    write_html_output(updated_rows,default_html)
+    section_html=build_html_table(updated_rows,default_html)
+    append_html_section(default_html,f"Screenshots ({os.path.basename(args.input_csv)})",section_html)
+    print(f"[+] Appended screenshots to {default_html}")
     if args.output_csv:
         write_csv_output(updated_rows,args.output_csv)
     win_path=to_windows_path(default_html)

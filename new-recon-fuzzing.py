@@ -14,11 +14,12 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
-import tempfile
 
 
 BASE_COLUMNS = ["DNS", "IP / Hosting Provider", "Ports", "Nuclei", "Notes"]
@@ -204,11 +205,11 @@ def derive_domain_from_filename(path: str) -> Optional[str]:
 def derive_output_path(input_path: str, provided: Optional[str]) -> str:
     if provided:
         return provided
-    domain = derive_domain_from_filename(input_path)
-    if domain:
-        base_dir = os.path.dirname(input_path)
-        return os.path.join(base_dir, f"new-recon-{domain}_output_ffuf.csv")
-    return f"{os.path.splitext(input_path)[0]}_ffuf.csv"
+    path = Path(input_path)
+    name = path.name
+    if name.endswith("_output_ffuf.csv"):
+        return str(path.with_name(name.replace("_output_ffuf.csv", "_output.csv")))
+    return input_path
 
 
 def normalize_host(host: str) -> str:
