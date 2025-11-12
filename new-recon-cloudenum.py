@@ -11,6 +11,8 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
+
+from bs4 import BeautifulSoup
 from typing import Optional
 try:
     from alive_progress import alive_bar
@@ -47,6 +49,13 @@ CATEGORY_LABELS={
     "netlify-bucket-enum":"Netlify Bucket",
     "backblaze-b2-bucket-enum":"Backblaze B2",
 }
+
+SECTION_ORDER=["stats","cloudenum","screenshots"]
+
+CLOUD_INTRO=(
+    "<p>Testers also discovered the following Cloud based Platform as a Service (PaaS) resources that may belong to the organization. "
+    "Assets marked as 'Protected' were determined to be inaccessible by testers.</p>"
+)
 
 HTML_STYLE_BLOCK=(
     "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
@@ -91,18 +100,37 @@ def _ensure_html_shell(path: str) -> None:
         )
 
 
-def append_html_section(path: str,title: str,inner_html: str) -> None:
+def append_html_section(path: str, section_id: str,title: str,inner_html: str) -> None:
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4 is required to build the HTML report")
     _ensure_html_shell(path)
     with open(path,"r",encoding="utf-8") as f:
-        content=f.read()
-    section=(f"<section class=\"report-section\">\n<h2>{html.escape(title)}</h2>\n"+inner_html+"\n</section>\n")
-    marker="</body>"
-    if marker in content:
-        content=content.replace(marker,section+marker,1)
+        soup=BeautifulSoup(f.read(),"html.parser")
+    body=soup.body or soup
+    existing=body.find("section",{"id":section_id})
+    new_section=soup.new_tag("section",id=section_id,attrs={"class":"report-section"})
+    h2=soup.new_tag("h2")
+    h2.string=title
+    new_section.append(h2)
+    fragment=BeautifulSoup(inner_html,"html.parser")
+    for child in list(fragment.contents):
+        new_section.append(child)
+    if existing:
+        existing.replace_with(new_section)
     else:
-        content+=section
+        inserted=False
+        if section_id in SECTION_ORDER:
+            idx=SECTION_ORDER.index(section_id)
+            for later_id in SECTION_ORDER[idx+1:]:
+                other=body.find("section",{"id":later_id})
+                if other:
+                    other.insert_before(new_section)
+                    inserted=True
+                    break
+        if not inserted:
+            body.append(new_section)
     with open(path,"w",encoding="utf-8") as f:
-        f.write(content)
+        f.write(str(soup))
 
 
 def extract_labels(dns_cell):
@@ -356,7 +384,7 @@ def main():
         section_parts.append("".join(finding_sections))
     else:
         section_parts.append("<p><em>No cloud assets discovered.</em></p>")
-    append_html_section(output_html,"Cloud Enumeration","".join(section_parts))
+    append_html_section(output_html,"cloudenum","Cloud Assets Discovered",CLOUD_INTRO+"".join(section_parts))
     print(f"[+] Appended cloud enum summary to {output_html}")
 
 

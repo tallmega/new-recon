@@ -14,6 +14,8 @@ import argparse, csv, html, io, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 from urllib.parse import urlparse
 
+from bs4 import BeautifulSoup
+
 try:
     from PIL import Image, ImageOps
     _HAS_PIL=True
@@ -42,6 +44,8 @@ NOTES_COL="Notes"
 IPV4_RE=re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 IPV6_RE=re.compile(r"\b([0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
 
+SECTION_ORDER=["stats","cloudenum","screenshots"]
+
 HTML_STYLE_BLOCK=(
     "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
     "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;table-layout:fixed;}"
@@ -60,6 +64,13 @@ HTML_STYLE_BLOCK=(
     ".note-entry{margin-bottom:12px;}"
     ".report-section{margin-bottom:40px;}"
     ".report-section h2{border-bottom:2px solid #000;padding-bottom:4px;margin-bottom:12px;}"
+)
+
+SCREENSHOT_INTRO=(
+    "<p>The following are the IPs, domain names and services discovered during the assessment, as well as images of the site and authentication prompts presented. "
+    "It is not possible to completely hide services from unwanted internet traffic, but discovered OS, platforms or applications may be targeted with customized or even zero-day exploits so should be patched regularly. "
+    "Publishing applications to the internet increases risk of attack, so services should not be published to the internet if they are only intended to be accessed by internal staff. "
+    "All the information below could be used to create a convincing social engineering attack.</p>"
 )
 
 
@@ -85,18 +96,37 @@ def _ensure_html_shell(path: str) -> None:
         )
 
 
-def append_html_section(path: str,title: str,inner_html: str) -> None:
+def append_html_section(path: str,section_id: str,title: str,inner_html: str) -> None:
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4 is required to build the HTML report")
     _ensure_html_shell(path)
     with open(path,"r",encoding="utf-8") as f:
-        content=f.read()
-    section=(f"<section class=\"report-section\">\n<h2>{html.escape(title)}</h2>\n"+inner_html+"\n</section>\n")
-    marker="</body>"
-    if marker in content:
-        content=content.replace(marker,section+marker,1)
+        soup=BeautifulSoup(f.read(),"html.parser")
+    body=soup.body or soup
+    existing=body.find("section",{"id":section_id})
+    new_section=soup.new_tag("section",id=section_id,attrs={"class":"report-section"})
+    h2=soup.new_tag("h2")
+    h2.string=title
+    new_section.append(h2)
+    fragment=BeautifulSoup(inner_html,"html.parser")
+    for child in list(fragment.contents):
+        new_section.append(child)
+    if existing:
+        existing.replace_with(new_section)
     else:
-        content+=section
+        inserted=False
+        if section_id in SECTION_ORDER:
+            idx=SECTION_ORDER.index(section_id)
+            for later_id in SECTION_ORDER[idx+1:]:
+                other=body.find("section",{"id":later_id})
+                if other:
+                    other.insert_before(new_section)
+                    inserted=True
+                    break
+        if not inserted:
+            body.append(new_section)
     with open(path,"w",encoding="utf-8") as f:
-        f.write(content)
+        f.write(str(soup))
 
 @dataclass(frozen=True)
 class Target:
@@ -255,22 +285,24 @@ def sanitize_fuzzing_text(text:str) -> str:
 def ensure_bordered_image(path:str) -> str:
     if not path or not _HAS_PIL or not os.path.isfile(path):
         return path
-    if _BORDER_CACHE.get(path):
-        return path
-    tmp_path=f"{path}.border_tmp"
+    cached=_BORDER_CACHE.get(path)
+    if cached and os.path.isfile(cached):
+        return cached
+    root,ext=os.path.splitext(path)
+    bordered_path=f"{root}_border{ext}"
     try:
         with Image.open(path) as img:
             if img.mode not in {"RGB","RGBA"}:
                 img=img.convert("RGB")
             fill_color=(50,50,50,255) if img.mode=="RGBA" else (50,50,50)
             bordered=ImageOps.expand(img,border=2,fill=fill_color)
-            bordered.save(tmp_path)
-        os.replace(tmp_path,path)
-        _BORDER_CACHE[path]=True
+            bordered.save(bordered_path)
+        _BORDER_CACHE[path]=bordered_path
+        return bordered_path
     except Exception:
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if os.path.exists(bordered_path):
+                os.remove(bordered_path)
         except OSError:
             pass
     return path
@@ -863,9 +895,6 @@ def load_eyewitness_mapping(base_dir:str) -> Dict[Tuple[str,int,str],Dict[str,st
             pass
     return mapping
 
-def sanitize(s:str) -> str:
-    return re.sub(r"[^0-9A-Za-z]+","_",s)
-
 def locate_screenshot(target:Target,mapping:Dict[Tuple[str,int,str],Dict[str,str]],shots:List[str]) -> Optional[Dict[str,str]]:
     host_key=canonical_host(target.host)
     path=normalize_path(target.path)
@@ -899,34 +928,6 @@ def locate_screenshot(target:Target,mapping:Dict[Tuple[str,int,str],Dict[str,str
             if val.get("status"):
                 return val
     return None
-
-def sanitize_filename(label:str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+","_",label)
-
-def capture_custom_screenshot(chrome_bin:str,url:str,out_dir:str,port:int) -> Optional[str]:
-    if not chrome_bin:
-        return None
-    os.makedirs(out_dir,exist_ok=True)
-    fname=sanitize_filename(f"{url}_{port}")[:120]
-    out_path=os.path.join(out_dir,f"{fname}.png")
-    cmd=[
-        chrome_bin,
-        "--headless",
-        "--disable-gpu",
-        "--hide-scrollbars",
-        "--ignore-certificate-errors",
-        "--allow-running-insecure-content",
-        "--disable-web-security",
-        "--log-level=2",
-        "--window-size=1366,768",
-        f"--screenshot={out_path}",
-        url,
-    ]
-    try:
-        subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=60)
-    except Exception:
-        return None
-    return out_path if os.path.isfile(out_path) else None
 
 def to_windows_path(path:str) -> Optional[str]:
     distro=os.environ.get("WSL_DISTRO_NAME")
@@ -1108,12 +1109,16 @@ def main():
     per_row_targets,all_targets=build_targets(rows,args.max_hosts_per_row,not args.include_boring)
     total=len(all_targets)
     default_html=derive_output_html_path(args.input_csv,args.output_html)
-    chrome_bin=None
     if not total:
         print("[i] No matching HTTP targets found; nothing to do.")
         updated=update_rows(rows,per_row_targets,{},[],{})
         section_html=build_html_table(updated,default_html)
-        append_html_section(default_html,f"Screenshots ({os.path.basename(args.input_csv)})",section_html)
+        append_html_section(
+            default_html,
+            "screenshots",
+            "External Perimeter Asset Inventory",
+            SCREENSHOT_INTRO + section_html,
+        )
         if args.output_csv:
             write_csv_output(updated,args.output_csv)
         win_path=to_windows_path(default_html)
@@ -1154,7 +1159,12 @@ def main():
 
     updated_rows=update_rows(rows,per_row_targets,mapping,shots,thumbs)
     section_html=build_html_table(updated_rows,default_html)
-    append_html_section(default_html,f"Screenshots ({os.path.basename(args.input_csv)})",section_html)
+    append_html_section(
+        default_html,
+        "screenshots",
+        "External Perimeter Asset Inventory",
+        SCREENSHOT_INTRO + section_html,
+    )
     print(f"[+] Appended screenshots to {default_html}")
     if args.output_csv:
         write_csv_output(updated_rows,args.output_csv)

@@ -30,6 +30,8 @@ IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\
 IPV6_RE = re.compile(r"\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
+SECTION_ORDER=["stats","cloudenum","screenshots"]
+
 HTML_STYLE_BLOCK = (
     "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
     "table{border-collapse:collapse;width:100%;border:1px solid #000;background:#fff;table-layout:fixed;}"
@@ -74,21 +76,37 @@ def _ensure_html_shell(path: str) -> None:
         )
 
 
-def append_html_section(path: str, title: str, inner_html: str) -> None:
+def append_html_section(path: str, section_id: str, title: str, inner_html: str) -> None:
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4 is required to build the HTML report")
     _ensure_html_shell(path)
     with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    section = (
-        f"<section class=\"report-section\">\n<h2>{html.escape(title)}</h2>\n"
-        f"{inner_html}\n" "</section>\n"
-    )
-    marker = "</body>"
-    if marker in content:
-        new_content = content.replace(marker, section + marker, 1)
+        soup = BeautifulSoup(f.read(), "html.parser")
+    body = soup.body or soup
+    existing = body.find("section", {"id": section_id})
+    new_section = soup.new_tag("section", id=section_id, attrs={"class": "report-section"})
+    h2 = soup.new_tag("h2")
+    h2.string = title
+    new_section.append(h2)
+    fragment = BeautifulSoup(inner_html, "html.parser")
+    for child in list(fragment.contents):
+        new_section.append(child)
+    if existing:
+        existing.replace_with(new_section)
     else:
-        new_content = content + section
+        inserted = False
+        if section_id in SECTION_ORDER:
+            idx = SECTION_ORDER.index(section_id)
+            for later_id in SECTION_ORDER[idx + 1:]:
+                other = body.find("section", {"id": later_id})
+                if other:
+                    other.insert_before(new_section)
+                    inserted = True
+                    break
+        if not inserted:
+            body.append(new_section)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+        f.write(str(soup))
 
 
 def _lower_list(values: Sequence[str]) -> List[str]:
@@ -657,7 +675,7 @@ def main() -> None:
 
     output_html = derive_output_html_path(args.inputs[0], args.output_html)
     html_items = "".join(f"<li>{html.escape(line)}</li>" for line in summary_lines)
-    append_html_section(output_html, "Recon Stats", f"<ul class='stats-list'>{html_items}</ul>")
+    append_html_section(output_html, "stats", "Summary of Internet facing Assets", f"<ul class='stats-list'>{html_items}</ul>")
     print(f"[+] Appended stats summary to {output_html}")
 
 if __name__ == "__main__":

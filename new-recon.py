@@ -250,7 +250,6 @@ def scan_ports(ip,skip=False,nmap_top_ports=5000,nmap_timeout="90s",nmap_extra=N
     if is6: cmd.insert(1,'-6')
     if nmap_extra:
         cmd[1:1]=nmap_extra
-    print(f"[i] Scanning {ip_str} (top {nmap_top_ports})")
     ports=set()
     try:
         out=subprocess.run(cmd,stdout=subprocess.PIPE,
@@ -463,8 +462,11 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
         if total_targets>1:
             print(f"[i] Scanning {total_targets} IPs with nmap (parallel)")
             with ThreadPoolExecutor(max_workers=nmap_workers) as executor:
-                future_map={executor.submit(scan_ports,ip,False,nmap_top_ports,nmap_timeout,nmap_extra):ip
-                            for ip in target_ips}
+                future_map={}
+                for ip in target_ips:
+                    print(f"[i] Scanning {ip} (top {nmap_top_ports})")
+                    fut=executor.submit(scan_ports,ip,False,nmap_top_ports,nmap_timeout,nmap_extra)
+                    future_map[fut]=ip
                 for fut in as_completed(future_map):
                     ip=future_map[fut]
                     print(f"[i] nmap target {ip}")
@@ -475,8 +477,9 @@ def run_scans(results,skip,explicit_ips,exclude_ips,
                         scanres[ip]='N/A'
         else:
             ip=target_ips[0]
-            print(f"[i] nmap target {ip}")
+            print(f"[i] Scanning {ip} (top {nmap_top_ports})")
             scanres[ip]=scan_ports(ip,False,nmap_top_ports,nmap_timeout,nmap_extra)
+            print(f"[i] nmap target {ip}")
 
     for ip in explicit_ips:
         if ip in results and ip not in exclude_ips and scanres.get(ip,'N/A')=='N/A':
