@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate EyeWitness screenshots from a new-recon + ai-notes CSV and render an HTML report.
+Generate Gowitness screenshots from a new-recon + ai-notes CSV and append an HTML report.
 
 Workflow:
   1. Parse the CSV (columns: DNS, IP / Hosting Provider, Ports, Nuclei, Notes)
   2. Select HTTP-like host:port combos that look interesting (non-empty Notes/Nuclei)
-  3. Write them to an EyeWitness targets file
-  4. Optionally run EyeWitness automatically
-  5. Build an HTML table (and optional CSV) with screenshot links for documentation
+  3. Write them to a targets file
+  4. Run gowitness (or mark entries pending)
+  5. Append an HTML table (and optional CSV) with screenshot links for documentation
 """
 
 import argparse, csv, html, io, json, os, re, shutil, subprocess, sys
@@ -262,8 +262,8 @@ def ensure_bordered_image(path:str) -> str:
         with Image.open(path) as img:
             if img.mode not in {"RGB","RGBA"}:
                 img=img.convert("RGB")
-            fill_color=(150,150,150,255) if img.mode=="RGBA" else (150,150,150)
-            bordered=ImageOps.expand(img,border=1,fill=fill_color)
+            fill_color=(50,50,50,255) if img.mode=="RGBA" else (50,50,50)
+            bordered=ImageOps.expand(img,border=2,fill=fill_color)
             bordered.save(tmp_path)
         os.replace(tmp_path,path)
         _BORDER_CACHE[path]=True
@@ -642,101 +642,75 @@ def write_targets_file(targets:Sequence[Target],path:str) -> None:
         for tgt in targets:
             f.write(target_to_url(tgt)+"\n")
 
-def _candidate_roots(root_hint:Optional[str]) -> List[str]:
-    roots=[]
-    if root_hint:
-        roots.append(os.path.expanduser(root_hint))
-    cwd=os.getcwd()
-    script_dir=os.path.dirname(os.path.abspath(__file__))
-    roots.extend([
-        cwd,
-        script_dir,
-        os.path.dirname(script_dir),
-        os.path.expanduser("~/EyeWitness"),
-        os.path.expanduser("~/eyewitness"),
-        os.path.expanduser("~/tools/EyeWitness"),
-    ])
-    cleaned=[]
-    seen=set()
-    for r in roots:
-        if not r:
-            continue
-        norm=os.path.normpath(r)
-        if norm in seen:
-            continue
-        seen.add(norm)
-        cleaned.append(norm)
-    return cleaned
-
-def resolve_eyewitness_python(explicit:Optional[str],root_hint:Optional[str]) -> Optional[str]:
-    if explicit:
-        expanded=os.path.expanduser(explicit)
-        if os.path.isfile(expanded) or shutil.which(expanded):
-            return expanded
-    for root in _candidate_roots(root_hint):
-        candidates=[
-            os.path.join(root,"eyewitness-venv","bin","python"),
-            os.path.join(root,"eyewitness-venv","Scripts","python.exe"),
-            os.path.join(root,"venv","bin","python"),
-            os.path.join(root,"venv","Scripts","python.exe"),
-            os.path.join(root,"bin","python"),
-            os.path.join(root,"Scripts","python.exe"),
-        ]
-        for cand in candidates:
-            if os.path.isfile(cand):
-                return cand
-    for fallback in ("python3","python"):
-        resolved=shutil.which(fallback)
-        if resolved:
-            return resolved
-    return None
-
-def resolve_eyewitness_script(explicit:Optional[str],root_hint:Optional[str]) -> Optional[str]:
-    if explicit:
-        expanded=os.path.expanduser(explicit)
-        return expanded if os.path.isfile(expanded) else None
-    for root in _candidate_roots(root_hint):
-        candidates=[
-            os.path.join(root,"Python","EyeWitness.py"),
-            os.path.join(root,"EyeWitness.py"),
-        ]
-        for cand in candidates:
-            if os.path.isfile(cand):
-                return cand
-    return None
-
-def build_default_extra(extra: Optional[List[str]]) -> List[str]:
-    result=list(extra or [])
-    ua_present=any(arg in ("--user-agent","-ua","-uA") for arg in result)
-    if not ua_present:
-        result.extend(["--user-agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"])
-    return result
-
-def run_eyewitness(python_bin:str,script:str,targets_file:str,out_dir:str,extra:List[str],timeout:int,workdir:Optional[str]) -> bool:
-    base_args=["--web","--timeout",str(timeout),"--no-prompt","-f",targets_file,"-d",out_dir]
-    combined_args=base_args+extra
-    commands=[]
-    if python_bin:
-        commands.append((python_bin,[python_bin,script]+combined_args))
-    commands.append(("system",["python3",script]+combined_args))
-    commands.append(("system",["python",script]+combined_args))
-    for label,argv in commands:
-        env=os.environ.copy()
-        if label != "system" and python_bin:
-            venv_dir=os.path.dirname(os.path.dirname(python_bin))
-            if os.path.exists(os.path.join(venv_dir,"bin","activate")) or os.path.exists(os.path.join(venv_dir,"Scripts","activate.bat")):
-                env["VIRTUAL_ENV"]=venv_dir
-                bin_dir=os.path.dirname(python_bin)
-                env["PATH"]=bin_dir+os.pathsep+env.get("PATH","")
-        cwd=workdir or os.path.dirname(script)
+def run_gowitness(
+    gowitness_bin:str,
+    targets_file:str,
+    screenshot_dir:str,
+    jsonl_path:str,
+    threads:int,
+    timeout:int,
+    delay:int,
+    extra:Optional[List[str]]=None,
+) -> bool:
+    os.makedirs(screenshot_dir,exist_ok=True)
+    if os.path.exists(jsonl_path):
         try:
-            subprocess.run(argv,check=True,env=env,cwd=cwd)
-            return True
-        except FileNotFoundError:
-            continue
-        except subprocess.CalledProcessError as exc:
-            print(f"[!] EyeWitness ({label}) exited with {exc.returncode}")
+            os.remove(jsonl_path)
+        except OSError:
+            pass
+    cmd=[
+        gowitness_bin,
+        "scan","file",
+        "-f",targets_file,
+        "--screenshot-path",screenshot_dir,
+        "--threads",str(max(1,threads)),
+        "--timeout",str(max(1,timeout)),
+        "--delay",str(max(0,delay)),
+        "--write-jsonl",
+        "--write-jsonl-file",jsonl_path,
+    ]
+    if extra:
+        cmd.extend(extra)
+    try:
+        subprocess.run(cmd,check=True)
+        return True
+    except FileNotFoundError:
+        print("[!] gowitness binary not found; install it or set --gowitness-bin.")
+    except subprocess.CalledProcessError as exc:
+        print(f"[!] gowitness exited with {exc.returncode}")
     return False
+
+
+def load_gowitness_results(jsonl_path:str,screenshot_dir:str) -> Dict[Tuple[str,int,str],Dict[str,str]]:
+    mapping={}
+    if not os.path.isfile(jsonl_path):
+        return mapping
+    with open(jsonl_path,"r",encoding="utf-8") as f:
+        for line in f:
+            line=line.strip()
+            if not line:
+                continue
+            try:
+                entry=json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            file_name=entry.get("file_name") or ""
+            shot_path=os.path.join(screenshot_dir,file_name) if file_name else ""
+            status=entry.get("response_code") or entry.get("status_code") or entry.get("status")
+            status=str(status) if status else ""
+            title=entry.get("title") or ""
+            urls_to_index=[]
+            primary=entry.get("url")
+            final_url=entry.get("final_url")
+            if primary:
+                urls_to_index.append(primary)
+            if final_url and final_url!=primary:
+                urls_to_index.append(final_url)
+            if not urls_to_index:
+                continue
+            for target_url in urls_to_index:
+                add_mapping_entry(mapping,target_url,shot_path,status,title)
+    return mapping
 
 def build_screenshot_index(base_dir:str) -> List[str]:
     shots=[]
@@ -962,7 +936,7 @@ def to_windows_path(path:str) -> Optional[str]:
     return f"\\\\wsl$\\{distro}\\{rel.replace('/', '\\')}"
 
 
-def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,object]]],mapping:Dict[Tuple[str,int,str],Dict[str,str]],shots:List[str],thumbs:Dict[str,str],custom_capture_dir:str,chrome_bin:Optional[str]) -> List[Dict[str,str]]:
+def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,object]]],mapping:Dict[Tuple[str,int,str],Dict[str,str]],shots:List[str],thumbs:Dict[str,str]) -> List[Dict[str,str]]:
     updated=[]
     for row,row_targets in zip(rows,per_row_targets):
         new_row={
@@ -972,6 +946,7 @@ def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,obje
             "notes_text":row.get("Notes","") or ""
         }
         fragments_summary=[]
+        summary_seen=set()
         note_fragments=_split_note_fragments(new_row["notes_text"])
         note_fragments=_annotate_redirect_notes(note_fragments)
         fragment_map={i:[] for i in range(len(note_fragments))}
@@ -997,28 +972,19 @@ def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,obje
             entry_dict["path_hint"]=normalize_path(tgt.path or "/")
             entry_dict["scheme_hint"]=tgt.scheme
             entry_dict["port_hint"]=tgt.port
-            # Determine summary text
-            needs_custom=False
-            title_lower=entry_dict["title"].lower()
-            if title_lower.startswith("!error") or (not shot_path):
-                needs_custom=True
-            if needs_custom and chrome_bin:
-                custom_path=capture_custom_screenshot(chrome_bin,resolved_url,custom_capture_dir,tgt.port)
-                if custom_path:
-                    shot_path=custom_path
-                    entry_dict["path"]=custom_path
-                    entry_dict["thumb"]=custom_path
-                    entry_dict["status"]="Headless capture"
-                    entry_dict["pending"]=False
+            summary_entry=None
             if shot_path:
-                fragments_summary.append(f"{label_display} -> {shot_path}")
+                summary_entry=f"{label_display} -> {shot_path}"
                 entry_dict["pending"]=False
             elif entry_dict["status"]:
-                fragments_summary.append(f"{label_display} -> {entry_dict['status']}")
+                summary_entry=f"{label_display} -> {entry_dict['status']}"
                 entry_dict["pending"]=False
             else:
-                fragments_summary.append(f"{label_display} -> (pending)")
+                summary_entry=f"{label_display} -> (pending)"
                 entry_dict["pending"]=True
+            if summary_entry and summary_entry not in summary_seen:
+                fragments_summary.append(summary_entry)
+                summary_seen.add(summary_entry)
             assigned=False
             candidate_indices=[]
             if isinstance(frag_idx,int):
@@ -1117,19 +1083,19 @@ def build_html_table(rows:List[Dict[str,str]],path:str) -> str:
     return buf.getvalue()
 
 def main():
-    p=argparse.ArgumentParser(description="Generate EyeWitness HTML report from new-recon CSV data.")
+    p=argparse.ArgumentParser(description="Generate gowitness screenshots from new-recon CSV data.")
     p.add_argument("input_csv",help="CSV from new-recon (after ai-notes).")
     p.add_argument("-o","--output-csv",help="Optional CSV to write enriched data (default: skip CSV).")
-    p.add_argument("--output-html",help="HTML report path (default: <input>_screenshots.html).")
+    p.add_argument("--output-html",help="HTML report path (default: derived _output.html).")
     p.add_argument("--max-hosts-per-row",type=int,default=25,help="Limit number of hostnames parsed per row.")
     p.add_argument("--include-boring",action="store_true",help="Include rows without interesting Notes/Nuclei.")
-    p.add_argument("--targets-file",help="Where to write EyeWitness targets list (default: <screenshot-dir>/targets.txt).")
-    p.add_argument("--screenshot-dir",default="eyewitness-output",help="EyeWitness output directory.")
-    p.add_argument("--eyewitness-root",default="~/EyeWitness",help="Path to EyeWitness project root (default: ~/EyeWitness).")
-    p.add_argument("--eyewitness-python",help="Path to EyeWitness python interpreter (default: auto-detect, try eyewitness-venv/bin/python).")
-    p.add_argument("--eyewitness-script",help="Path to EyeWitness.py (default: ./Python/EyeWitness.py).")
-    p.add_argument("--eyewitness-timeout",type=int,default=25,help="EyeWitness timeout seconds per target.")
-    p.add_argument("--eyewitness-extra",nargs=argparse.REMAINDER,help="Additional arguments to pass to EyeWitness (appended at end).")
+    p.add_argument("--targets-file",help="Where to write gowitness targets list (default: <screenshot-dir>/targets.txt).")
+    p.add_argument("--screenshot-dir",default="gowitness-output",help="gowitness screenshot directory.")
+    p.add_argument("--gowitness-bin",default="gowitness",help="Path to gowitness binary (default: gowitness in PATH).")
+    p.add_argument("--gowitness-threads",type=int,default=10,help="gowitness --threads value (default 10).")
+    p.add_argument("--gowitness-timeout",type=int,default=25,help="gowitness --timeout value in seconds (default 25).")
+    p.add_argument("--gowitness-delay",type=int,default=10,help="Delay between navigation and screenshot (default 10).")
+    p.add_argument("--gowitness-extra",nargs=argparse.REMAINDER,help="Additional arguments passed to gowitness scan.")
     args=p.parse_args()
 
     with open(args.input_csv,encoding="utf-8-sig",newline="") as f:
@@ -1142,62 +1108,51 @@ def main():
     per_row_targets,all_targets=build_targets(rows,args.max_hosts_per_row,not args.include_boring)
     total=len(all_targets)
     default_html=derive_output_html_path(args.input_csv,args.output_html)
-    chrome_bin=shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
-    custom_dir=os.path.abspath(os.path.join(args.screenshot_dir,"custom-shots"))
+    chrome_bin=None
     if not total:
         print("[i] No matching HTTP targets found; nothing to do.")
-        updated=update_rows(rows,per_row_targets,{},[],{},custom_dir,chrome_bin)
-        write_html_output(updated,default_html)
+        updated=update_rows(rows,per_row_targets,{},[],{})
+        section_html=build_html_table(updated,default_html)
+        append_html_section(default_html,f"Screenshots ({os.path.basename(args.input_csv)})",section_html)
         if args.output_csv:
             write_csv_output(updated,args.output_csv)
+        win_path=to_windows_path(default_html)
+        if win_path:
+            print(f"[i] Windows path: {win_path}")
         return
 
     screenshot_dir=os.path.abspath(args.screenshot_dir)
-    custom_dir=os.path.join(screenshot_dir,"custom-shots")
     targets_file=os.path.abspath(args.targets_file or os.path.join(screenshot_dir,"targets.txt"))
     write_targets_file(all_targets,targets_file)
     print(f"[i] Wrote {total} targets -> {targets_file}")
 
-    python_bin=resolve_eyewitness_python(args.eyewitness_python,args.eyewitness_root)
-    script_path=resolve_eyewitness_script(args.eyewitness_script,args.eyewitness_root)
-    eyewitness_root=None
-    if script_path:
-        eyewitness_root=os.path.dirname(os.path.dirname(script_path)) if script_path.endswith("EyeWitness.py") else os.path.dirname(script_path)
-    out_dir=os.path.abspath(screenshot_dir)
-    exec_targets=targets_file
-    cleanup_target=None
-    if eyewitness_root:
-        exec_targets=os.path.join(eyewitness_root,"targets_autogen.txt")
-        shutil.copyfile(targets_file,exec_targets)
-        cleanup_target=exec_targets
+    gowitness_bin=shutil.which(args.gowitness_bin) or args.gowitness_bin
+    jsonl_path=os.path.join(screenshot_dir,"gowitness.jsonl")
     shots=[]
     thumbs={}
     mapping={}
-    try:
-        if not python_bin or not script_path:
-            print("[!] EyeWitness python or script not found; screenshots will be marked pending.")
-            shots=[]
+    if gowitness_bin:
+        ok=run_gowitness(
+            gowitness_bin,
+            targets_file,
+            screenshot_dir,
+            jsonl_path,
+            args.gowitness_threads,
+            args.gowitness_timeout,
+            args.gowitness_delay,
+            args.gowitness_extra,
+        )
+        if ok:
+            print(f"[i] gowitness finished, collecting screenshots from {screenshot_dir}")
+            mapping=load_gowitness_results(jsonl_path,screenshot_dir)
+            shots=build_screenshot_index(screenshot_dir)
+            thumbs=generate_thumbnails(shots,screenshot_dir)
         else:
-            ensure_dir(out_dir)
-            extra=build_default_extra(args.eyewitness_extra)
-            ok=run_eyewitness(python_bin,script_path,exec_targets,out_dir,extra,args.eyewitness_timeout,eyewitness_root)
-            if ok:
-                print(f"[i] EyeWitness finished, collecting screenshots from {out_dir}")
-                mapping=load_eyewitness_mapping(out_dir)
-                shots=build_screenshot_index(out_dir)
-                thumbs=generate_thumbnails(shots,out_dir)
-            else:
-                print("[!] EyeWitness run failed; screenshots will be marked pending.")
-                shots=[]
-                thumbs={}
-    finally:
-        if cleanup_target and os.path.exists(cleanup_target):
-            try:
-                os.remove(cleanup_target)
-            except OSError:
-                pass
+            print("[!] gowitness run failed; screenshots will be marked pending.")
+    else:
+        print("[!] gowitness binary not found; screenshots will be marked pending.")
 
-    updated_rows=update_rows(rows,per_row_targets,mapping,shots,thumbs,custom_dir,chrome_bin)
+    updated_rows=update_rows(rows,per_row_targets,mapping,shots,thumbs)
     section_html=build_html_table(updated_rows,default_html)
     append_html_section(default_html,f"Screenshots ({os.path.basename(args.input_csv)})",section_html)
     print(f"[+] Appended screenshots to {default_html}")

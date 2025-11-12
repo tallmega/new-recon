@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--wordlist",
-        default="./SecLists/Discovery/Web-Content/common.txt",
-        help="Path to ffuf wordlist (default ./SecLists/Discovery/Web-Content/common.txt)",
+        default="./wordlists/common.txt",
+        help="Path to ffuf wordlist (default ./wordlists/common.txt)",
     )
     parser.add_argument(
         "--extra-wordlist",
