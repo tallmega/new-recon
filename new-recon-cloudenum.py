@@ -26,7 +26,7 @@ GENERIC_SUFFIXES=[
     "dev","development","stage","staging","test","testing","internal","intranet","net","web"
 ]
 GENERIC_PREFIXES={"the","my","app","portal","service"}
-MUTATIONS_FILE="./wordlists/fuzz.txt"
+MUTATIONS_FILE="./wordlists/cloudfuzz.txt"
 BASE_LIMIT=3
 ROOT_LIMIT=2
 CATEGORY_LABELS={

@@ -255,23 +255,25 @@ def sanitize_fuzzing_text(text:str) -> str:
 def ensure_bordered_image(path:str) -> str:
     if not path or not _HAS_PIL or not os.path.isfile(path):
         return path
-    cached=_BORDER_CACHE.get(path)
-    if cached and os.path.isfile(cached):
-        return cached
-    root,ext=os.path.splitext(path)
-    bordered_path=f"{root}_border{ext}"
+    if _BORDER_CACHE.get(path):
+        return path
+    tmp_path=f"{path}.border_tmp"
     try:
         with Image.open(path) as img:
-            mode=img.mode
-            if mode not in {"RGB","RGBA"}:
+            if img.mode not in {"RGB","RGBA"}:
                 img=img.convert("RGB")
-            fill_color=(160,160,160,255) if img.mode=="RGBA" else (160,160,160)
+            fill_color=(150,150,150,255) if img.mode=="RGBA" else (150,150,150)
             bordered=ImageOps.expand(img,border=1,fill=fill_color)
-            bordered.save(bordered_path)
+            bordered.save(tmp_path)
+        os.replace(tmp_path,path)
+        _BORDER_CACHE[path]=True
     except Exception:
-        return path
-    _BORDER_CACHE[path]=bordered_path
-    return bordered_path
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+    return path
 
 
 def _annotate_redirect_notes(fragments:List[str]) -> List[str]:

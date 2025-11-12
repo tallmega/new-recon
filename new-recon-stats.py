@@ -126,7 +126,7 @@ PRIORITY_SOFTWARE = [
 SOFTWARE_SIGNATURES: List[Dict[str, object]] = [
     {"label": "WordPress", "keywords": ["wordpress", "wp-login", "wp-admin", "wp-content"]},
     {"label": "Microsoft Exchange / OWA", "keywords": ["microsoft exchange", "outlook web app", "owa"]},
-    {"label": "Fortinet FortiGate VPN", "keywords": ["fortinet", "fortigate", "forticlient"]},
+    {"label": "Fortinet FortiGate VPN", "keywords": ["fortinet", "fortigate", "forticlient", "acme access only"]},
     {"label": "Palo Alto GlobalProtect", "keywords": ["globalprotect"]},
     {"label": "Cisco AnyConnect / ASA", "keywords": ["anyconnect", "cisco asa"]},
     {"label": "Citrix Gateway / NetScaler", "keywords": ["citrix gateway", "netscaler", "citrix adc"]},

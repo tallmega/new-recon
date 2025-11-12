@@ -74,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to ffuf wordlist (default ./SecLists/Discovery/Web-Content/common.txt)",
     )
     parser.add_argument(
+        "--extra-wordlist",
+        default="./wordlists/customdirfuzz.txt",
+        help="Optional second ffuf wordlist to include (default ./wordlists/customdirfuzz.txt)",
+    )
+    parser.add_argument(
         "--match-status",
         default="200,301,302,401,403,404",
         help="Comma-separated ffuf -mc codes (default: 200,301,302,401,403,404)",
@@ -331,6 +336,7 @@ def build_ffuf_command(
     scheme: str,
     port: int,
     wordlist: str,
+    extra_wordlist: Optional[str],
     match_status: str,
     threads: int,
     timeout: int,
@@ -341,7 +347,7 @@ def build_ffuf_command(
         base_url = f"{scheme}://{host_part}:{port}/FUZZ"
     else:
         base_url = f"{scheme}://{host_part}/FUZZ"
-    return [
+    cmd = [
         ffuf_bin,
         "-u",
         base_url,
@@ -356,6 +362,9 @@ def build_ffuf_command(
         "-timeout",
         str(timeout),
     ]
+    if extra_wordlist and os.path.isfile(extra_wordlist):
+        cmd.extend(["-w", f"{extra_wordlist}:FUZZ"])
+    return cmd
 
 
 def run_ffuf(command: Sequence[str]) -> Optional[Dict]:
@@ -526,6 +535,8 @@ def ensure_wordlist(path: str) -> None:
 def main() -> None:
     args = parse_args()
     ensure_wordlist(args.wordlist)
+    if args.extra_wordlist:
+        ensure_wordlist(args.extra_wordlist)
     rows, fieldnames = read_csv_rows(args.input_csv)
     known_hosts = collect_known_hosts(rows)
     targets = hosts_to_target(rows)
@@ -541,6 +552,7 @@ def main() -> None:
             target.scheme,
             target.port,
             args.wordlist,
+            args.extra_wordlist,
             args.match_status,
             args.threads,
             args.timeout,
