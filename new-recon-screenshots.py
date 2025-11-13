@@ -400,23 +400,56 @@ def is_simple_http_to_https_redirect(fragments:List[str],target:Target) -> bool:
                     return True
     return False
 
-def is_simple_http_to_https_redirect(fragments:List[str],target:Target) -> bool:
-    if target.scheme.lower()!="http" or normalize_path(target.path or "/")!="/":
+TIMEOUT_KEYWORDS=(
+    "timeout",
+    "no response",
+    "no-response",
+    "connection reset",
+    "connection refused",
+    "did not respond",
+    "empty reply",
+    "refused connection",
+)
+
+def fragment_indicates_timeout(fragment:str,host:str) -> bool:
+    if not fragment:
+        return False
+    lower=fragment.lower()
+    if canonical_host(host) not in lower:
+        return False
+    return any(keyword in lower for keyword in TIMEOUT_KEYWORDS)
+
+def _iter_redirects(fragments:List[str]):
+    for frag in fragments:
+        for match in NOTE_REDIRECT_RE.finditer(frag):
+            yield match
+
+def _extract_sources(src_raw:str) -> List[Tuple[str,str,int]]:
+    sources=[]
+    for src in (s.strip() for s in src_raw.split(",") if s.strip()):
+        base=_parse_label_url(src)
+        if base:
+            sources.append(base)
+    return sources
+
+def is_https_redirect_source(fragments:List[str],target:Target) -> bool:
+    if target.scheme.lower()!="https" or normalize_path(target.path or "/")!="/":
         return False
     host=canonical_host(target.host)
-    for frag in fragments:
-        for match in SIMPLE_HTTP_REDIRECT_RE.finditer(frag):
-            src=match.group(1).strip()
-            dst=match.group(2).strip()
-            try:
-                src_parsed=urlparse(src)
-                dst_parsed=urlparse(dst)
-            except Exception:
-                continue
-            src_host=canonical_host(src_parsed.hostname or "")
-            dst_host=canonical_host(dst_parsed.hostname or "")
-            if src_host==host and dst_host==host:
-                if normalize_path(dst_parsed.path or "/")=="/":
+    for match in _iter_redirects(fragments):
+        sources=_extract_sources(match.group(1).strip())
+        for scheme,src_host,_ in sources:
+            if canonical_host(src_host)==host and scheme.lower()=="https":
+                dest=_resolve_destination(match.group(2).strip(),(scheme,src_host,target.port))
+                if not dest:
+                    continue
+                try:
+                    parsed=urlparse(dest)
+                except Exception:
+                    continue
+                dest_host=canonical_host(parsed.hostname or "")
+                dest_path=normalize_path(parsed.path or "/")
+                if dest_host!=host or dest_path!="/":
                     return True
     return False
 
@@ -622,10 +655,9 @@ def extract_redirect_targets(fragments:List[str],known_hosts:Set[str]) -> Tuple[
                 url_path=normalize_path(parsed.path or "/")
                 src_canon=canonical_host(host)
                 dest_canon=canonical_host(url_host)
-                if dest_canon==src_canon:
-                    suppress_bases.add((src_canon, scheme.lower()))
-                    if url_scheme==scheme.lower() and url_path=="/":
-                        continue
+                suppress_bases.add((src_canon, scheme.lower()))
+                if dest_canon==src_canon and url_scheme==scheme.lower() and url_path=="/":
+                    continue
                 urls.append((Target(host=url_host,port=url_port,scheme=url_scheme,path=url_path),idx))
             except Exception:
                 continue
@@ -1024,7 +1056,11 @@ def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,obje
             label_display=resolved_url
             if tgt.status:
                 label_display=f"{label_display} [{tgt.status}]"
+            if tgt.scheme.lower()=="http":
+                label_display=target_to_url(tgt)
             if is_simple_http_to_https_redirect(note_fragments,tgt):
+                continue
+            if is_https_redirect_source(note_fragments,tgt):
                 continue
             shot_path=shot_info.get("path") or ""
             entry_dict={
@@ -1034,6 +1070,20 @@ def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,obje
                 "status":(shot_info.get("status") or "").strip(),
                 "title":(shot_info.get("title") or "").strip(),
             }
+            timeout_flag=False
+            if isinstance(frag_idx,int) and 0<=frag_idx<len(note_fragments):
+                timeout_flag=fragment_indicates_timeout(note_fragments[frag_idx],tgt.host)
+            elif not isinstance(frag_idx,int):
+                for frag in note_fragments:
+                    if fragment_indicates_timeout(frag,tgt.host):
+                        timeout_flag=True
+                        break
+            if timeout_flag and shot_path:
+                shot_path=""
+                entry_dict["path"]=""
+                entry_dict["thumb"]=""
+                entry_dict["note"]="No screenshot captured (timeout/no response)."
+                entry_dict["note_class"]="shot-note"
             entry_dict["host_hint"]=canonical_host(tgt.host)
             entry_dict["path_hint"]=normalize_path(tgt.path or "/")
             entry_dict["scheme_hint"]=tgt.scheme
