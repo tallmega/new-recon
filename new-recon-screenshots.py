@@ -256,11 +256,12 @@ def is_interesting_row(nuclei:str,notes:str) -> bool:
     return True
 
 URL_EXTRACT_RE=re.compile(r"https?://[^\s;,]+",re.IGNORECASE)
-FUZZ_ENTRY_RE=re.compile(r"^(?:Fuzz(?:ing\s+Results\s*-\s*)?)\s*([^:]+):\s*(.+)$",re.IGNORECASE)
+FUZZ_ENTRY_RE=re.compile(r"^(?:Fuzz(?:ing\s+Results\s*-\s*)?)\s*(.+)$",re.IGNORECASE)
 REDIRECT_RE=re.compile(r"redirect\s*->\s*([^;|]+)",re.IGNORECASE)
 OK_RE=re.compile(r"200\s*->\s*([^;|]+)",re.IGNORECASE)
 STATUS_SUFFIX_RE=re.compile(r"\s*\[([0-9]{3})\]\s*$")
-NOTE_REDIRECT_RE=re.compile(r"(https?://[^\s;,]+)\s*->\s*([^;|]+)")
+NOTE_REDIRECT_RE=re.compile(r"((?:https?://[^\s;,]+(?:\s*,\s*)?)*)\s*->\s*([^;|]+)")
+SIMPLE_HTTP_REDIRECT_RE=re.compile(r"(http://[^\s;,]+)\s*->\s*(https://[^\s;,]+)",re.IGNORECASE)
 FILE_EXT_HINTS={"php","asp","aspx","jsp","html","htm","cgi","pl","cfm","php5","php7","jspx","do","action"}
 FUZZ_NO_MATCH_RE=re.compile(r"Fuzzing Results\s*-\s*(?:[^:]+:\s*)?no\s+ffuf\s+matches",re.IGNORECASE)
 
@@ -312,9 +313,14 @@ def _annotate_redirect_notes(fragments:List[str]) -> List[str]:
     annotated=[]
     for frag in fragments:
         def _replace(match):
-            src=match.group(1).strip()
+            src_raw=match.group(1).strip()
             dest_raw=match.group(2)
-            base=_parse_label_url(src)
+            sources=[s.strip() for s in src_raw.split(",") if s.strip()]
+            base=None
+            for src in sources:
+                base=_parse_label_url(src)
+                if base:
+                    break
             if not base:
                 return match.group(0)
             dest_url=_resolve_destination(dest_raw,base)
@@ -370,7 +376,49 @@ def find_fragment_index(fragments:List[str],host_hint:str,path_hint:str,scheme_h
             return idx
         if host_hint and host_hint in lower and not urls:
             return idx
+        if host_hint and path_hint.strip("/") and host_hint in lower and path_hint.strip("/") in lower:
+            return idx
     return None
+
+def is_simple_http_to_https_redirect(fragments:List[str],target:Target) -> bool:
+    if target.scheme.lower()!="http" or normalize_path(target.path or "/")!="/":
+        return False
+    host=canonical_host(target.host)
+    for frag in fragments:
+        for match in SIMPLE_HTTP_REDIRECT_RE.finditer(frag):
+            src=match.group(1).strip()
+            dst=match.group(2).strip()
+            try:
+                src_parsed=urlparse(src)
+                dst_parsed=urlparse(dst)
+            except Exception:
+                continue
+            src_host=canonical_host(src_parsed.hostname or "")
+            dst_host=canonical_host(dst_parsed.hostname or "")
+            if src_host==host and dst_host==host:
+                if normalize_path(dst_parsed.path or "/")=="/":
+                    return True
+    return False
+
+def is_simple_http_to_https_redirect(fragments:List[str],target:Target) -> bool:
+    if target.scheme.lower()!="http" or normalize_path(target.path or "/")!="/":
+        return False
+    host=canonical_host(target.host)
+    for frag in fragments:
+        for match in SIMPLE_HTTP_REDIRECT_RE.finditer(frag):
+            src=match.group(1).strip()
+            dst=match.group(2).strip()
+            try:
+                src_parsed=urlparse(src)
+                dst_parsed=urlparse(dst)
+            except Exception:
+                continue
+            src_host=canonical_host(src_parsed.hostname or "")
+            dst_host=canonical_host(dst_parsed.hostname or "")
+            if src_host==host and dst_host==host:
+                if normalize_path(dst_parsed.path or "/")=="/":
+                    return True
+    return False
 
 def _parse_label_url(label:str) -> Optional[Tuple[str,str,int]]:
     label=label.strip()
@@ -497,8 +545,12 @@ def extract_fuzz_targets(fragments:List[str],known_hosts:Set[str]) -> List[Tuple
         m=FUZZ_ENTRY_RE.match(frag)
         if not m:
             continue
-        label=m.group(1).strip()
-        rest=m.group(2)
+        remainder=m.group(1).strip()
+        label, sep, rest = remainder.rpartition(":")
+        if not sep:
+            continue
+        label=label.strip()
+        rest=rest.strip()
         base=_parse_label_url(label)
         if not base:
             continue
@@ -528,7 +580,7 @@ def extract_fuzz_targets(fragments:List[str],known_hosts:Set[str]) -> List[Tuple
         try:
             parsed=urlparse(candidate)
             chost=canonical_host(parsed.hostname or "")
-            if known_hosts and chost not in known_hosts:
+            if known_hosts and chost not in known_hosts and not all(_looks_like_ip(h) for h in known_hosts):
                 continue
             url_scheme=parsed.scheme or scheme
             url_host=parsed.hostname or host
@@ -544,10 +596,15 @@ def extract_redirect_targets(fragments:List[str],known_hosts:Set[str]) -> Tuple[
     suppress_bases=set()
     for idx,frag in enumerate(fragments):
         for match in NOTE_REDIRECT_RE.finditer(frag):
-            src=match.group(1).strip()
+            src_raw=match.group(1).strip()
             dest_fragment=match.group(2).strip()
             dest=dest_fragment.split(",")[0].strip()
-            base=_parse_label_url(src)
+            sources=[s.strip() for s in src_raw.split(",") if s.strip()]
+            base=None
+            for src in sources:
+                base=_parse_label_url(src)
+                if base:
+                    break
             if not base:
                 continue
             scheme,host,port=base
@@ -557,7 +614,7 @@ def extract_redirect_targets(fragments:List[str],known_hosts:Set[str]) -> Tuple[
             try:
                 parsed=urlparse(dest_url)
                 chost=canonical_host(parsed.hostname or "")
-                if known_hosts and chost not in known_hosts:
+                if known_hosts and chost not in known_hosts and not all(_looks_like_ip(h) for h in known_hosts):
                     continue
                 url_scheme=(parsed.scheme or scheme).lower()
                 url_host=parsed.hostname or host
@@ -967,6 +1024,8 @@ def update_rows(rows:List[Dict[str,str]],per_row_targets:List[List[Dict[str,obje
             label_display=resolved_url
             if tgt.status:
                 label_display=f"{label_display} [{tgt.status}]"
+            if is_simple_http_to_https_redirect(note_fragments,tgt):
+                continue
             shot_path=shot_info.get("path") or ""
             entry_dict={
                 "label":label_display,
@@ -1180,3 +1239,12 @@ def main():
 
 if __name__=="__main__":
     main()
+def _looks_like_ip(value:str) -> bool:
+    value=value.strip()
+    if not value:
+        return False
+    if IPV4_RE.fullmatch(value):
+        return True
+    if IPV6_RE.fullmatch(value):
+        return True
+    return False
