@@ -473,7 +473,7 @@ def _resolve_destination(value:str,base:Tuple[str,str,int],prefer_relative:bool=
     if value.startswith("//"):
         return f"{base[0]}:{value}"
     if value.lower() in {"http","https"}:
-        return _build_url(value.lower(),base[1],base[2],"/")
+        return _build_url(value.lower(),base[1],None,"/")
     if value.startswith("/"):
         return _build_url(base[0],base[1],base[2],value)
     segment=value.split("/",1)[0]
