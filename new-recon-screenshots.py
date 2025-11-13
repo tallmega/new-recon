@@ -478,9 +478,15 @@ def _resolve_destination(value:str,base:Tuple[str,str,int],prefer_relative:bool=
         return _build_url(base[0],base[1],base[2],value)
     segment=value.split("/",1)[0]
     if _segment_is_domain(segment):
-        host,value_path=(value.split("/",1)+[""])[:2]
+        host_part,value_path=(value.split("/",1)+[""])[:2]
+        port_override=None
+        if ":" in host_part:
+            maybe_host,maybe_port=host_part.rsplit(":",1)
+            if maybe_port.isdigit():
+                port_override=int(maybe_port)
+                host_part=maybe_host
         value_path=f"/{value_path}" if value_path else "/"
-        return _build_url("https",host,None,value_path)
+        return _build_url("https",host_part,port_override,value_path)
     # treat remaining token as relative path/file
     rel_path=value if value.startswith("/") else f"/{value.lstrip('/')}"
     return _build_url(base[0],base[1],base[2],rel_path if rel_path else "/")

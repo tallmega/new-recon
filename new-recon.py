@@ -328,6 +328,28 @@ def write_csv(outfile,data):
             w.writerow({'DNS':dns,'IP / Hosting Provider':ip,'Ports':ports_str,'Nuclei':nuc_str,'Notes':''})
     print(f"[i] CSV written: {outfile}")
 
+
+def run_followup_pipeline(output_csv:str) -> None:
+    base_dir=os.path.dirname(os.path.abspath(__file__))
+    scripts=[
+        "new-recon-ainotes.py",
+        "new-recon-fuzzing.py",
+        "new-recon-stats.py",
+        "new-recon-cloudenum.py",
+        "new-recon-screenshots.py",
+    ]
+    for script in scripts:
+        script_path=os.path.join(base_dir,script)
+        if not os.path.isfile(script_path):
+            print(f"[!] Follow-up script {script} not found; skipping")
+            continue
+        cmd=[sys.executable,script_path,output_csv]
+        print(f"[i] Running {script} with {output_csv}")
+        try:
+            subprocess.run(cmd,check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"[!] {script} exited with {exc.returncode}; continuing")
+
 # ---------- enumeration helpers ----------
 def run_subfinder(domain,resolvers=None):
     cmd=["subfinder","-d",domain,"-silent","-all"]
@@ -620,6 +642,8 @@ if __name__=="__main__":
                    help="Skip gobuster dns enumeration")
     p.add_argument("--domain-delay",type=float,default=300.0,
                    help="Seconds to sleep between domain enumerations (default 300.0)")
+    p.add_argument("--standalone",action="store_true",
+                   help="Skip automatic follow-up scripts after CSV generation")
     a=p.parse_args()
 
     ips=process_input_file(a.input) if a.input else set()
@@ -678,3 +702,8 @@ if __name__=="__main__":
         outfile_base="custom"
     outfile=f"new-recon-{safe_name(outfile_base)}_output.csv"
     write_csv(outfile,allres)
+    if not a.standalone:
+        if os.environ.get("OPENAI_API_KEY"):
+            run_followup_pipeline(outfile)
+        else:
+            print("[!] OPENAI_API_KEY not set; skipping automated follow-up scripts. Use --standalone to suppress this warning.")

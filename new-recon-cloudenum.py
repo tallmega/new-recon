@@ -318,7 +318,7 @@ def main():
     parser.add_argument("csv",help="Path to new-recon-*_output.csv")
     parser.add_argument("--top",type=int,default=10,help="How many results to display (default 10)")
     parser.add_argument("--cloud-workers",type=int,default=5,help="Parallel nuclei workers for cloud enum (default 5)")
-    parser.add_argument("--cloud-delay",type=float,default=0.0,help="Delay in seconds between nuclei runs to avoid throttling (default 0.0)")
+    parser.add_argument("--cloud-delay",type=float,default=0.3,help="Delay in seconds between nuclei runs to avoid throttling (default 0.3)")
     parser.add_argument("--cloud-debug",action="store_true",help="Print nuclei commands and output for debugging")
     parser.add_argument("--output-html",help="Aggregated HTML report path (default: derive _output.html)")
     args=parser.parse_args()
@@ -371,11 +371,11 @@ def main():
     top_bases_html="".join(
         f"<li>{html.escape(label)} - {count}</li>" for label,count in base_counter.most_common(args.top)
     )
-    if top_bases_html:
-        section_parts.append(f"<h3>Top SLDs</h3><ul>{top_bases_html}</ul>")
-    candidates_html=", ".join(html.escape(k) for k in keywords)
-    if candidates_html:
-        section_parts.append(f"<p><strong>Keywords:</strong> {candidates_html}</p>")
+    #if top_bases_html:
+        #section_parts.append(f"<h3>Top SLDs</h3><ul>{top_bases_html}</ul>")
+    #candidates_html=", ".join(html.escape(k) for k in keywords)
+    #if candidates_html:
+    #    section_parts.append(f"<p><strong>Keywords:</strong> {candidates_html}</p>")
     if findings and any(findings.values()):
         finding_sections=[]
         for category in sorted(findings.keys()):
