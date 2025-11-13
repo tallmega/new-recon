@@ -1,0 +1,50 @@
+id: azure-storage-account-enum
+
+info:
+  name: Azure Storage Account Enumeration (cloud_enum-style)
+  author: kevin
+  severity: info
+  description: |
+    Enumerates Azure Storage Accounts by brute-forcing account names and
+    identifying responses that indicate a real account exists, similar to
+    cloud_enum's check_storage_accounts.
+  metadata:
+    verified: false
+    max-request: 1
+  tags: cloud,enum,cloud-enum,azure,blob,discovery
+
+self-contained: true
+
+variables:
+  BaseDNS: "blob.core.windows.net"
+
+http:
+  - raw:
+      - |
+        GET http://{{wordlist}}.{{BaseDNS}}/ HTTP/1.1
+        Host: {{wordlist}}.{{BaseDNS}}
+
+    attack: batteringram
+    redirects: false
+    threads: 10
+
+    # Single matcher name, multiple body patterns -> "this account exists"
+    matchers:
+      - type: word
+        name: "Azure Storage Account"
+        part: body
+        words:
+          - "InvalidQueryParameterValue"
+          - "AccountRequiresHttps"
+          - "Server failed to authenticate the request"
+          - "The specified account is disabled"
+          - "AuthorizationPermissionMismatch"
+        condition: or
+
+    # Clean output URL for post-processing / feeding into other tools
+    extractors:
+      - type: dsl
+        name: storage-account
+        dsl:
+          - '"https://" + wordlist + "." + BaseDNS'
+        internal: false

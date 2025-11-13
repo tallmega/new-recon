@@ -6,6 +6,7 @@ import html
 import os
 import re
 import subprocess
+import shutil
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +30,10 @@ GENERIC_SUFFIXES=[
 ]
 GENERIC_PREFIXES={"the","my","app","portal","service"}
 MUTATIONS_FILE="./wordlists/cloudfuzz.txt"
+SCRIPT_DIR=Path(__file__).resolve().parent
+CUSTOM_CLOUD_TEMPLATE_DIR=SCRIPT_DIR/"templates"/"cloud"
+NUCLEI_TEMPLATE_ROOT=Path(os.environ.get("NUCLEI_TEMPLATES_DIR","./nuclei-templates"))
+NUCLEI_CLOUD_ENUM_DIR=NUCLEI_TEMPLATE_ROOT/"cloud"/"enum"
 BASE_LIMIT=3
 ROOT_LIMIT=2
 CATEGORY_LABELS={
@@ -36,6 +41,7 @@ CATEGORY_LABELS={
     "aws-s3-bucket-enum":"AWS S3 Bucket",
     "azure-blob-container-enum":"Azure Blob Storage",
     "azure-blob-enum":"Azure Blob Storage",
+    "azure-storage-account-enum":"Azure Storage Account",
     "oracle-bucket-enum":"Oracle Object Storage",
     "ibm-cloud-bucket-enum":"IBM Cloud Object Storage",
     "wasabi-bucket-enum":"Wasabi Bucket",
@@ -196,6 +202,22 @@ def build_names(base_list,mutations):
     return results
 
 
+def sync_custom_cloud_templates(force:bool=False) -> None:
+    source_dir=CUSTOM_CLOUD_TEMPLATE_DIR
+    if not source_dir.is_dir():
+        return
+    dest_dir=NUCLEI_CLOUD_ENUM_DIR
+    dest_dir.mkdir(parents=True,exist_ok=True)
+    copied=False
+    for template_path in source_dir.glob("*.yaml"):
+        target_path=dest_dir/template_path.name
+        if force or not target_path.exists():
+            shutil.copy2(template_path,target_path)
+            copied=True
+    if copied:
+        print(f"[i] Installed custom cloud enum templates into {dest_dir}")
+
+
 def pick_keywords(base_counter,root_counter,base_limit=BASE_LIMIT,root_limit=ROOT_LIMIT):
     keywords=[]
     for label,_ in base_counter.most_common(base_limit):
@@ -225,6 +247,7 @@ def run_cloud_enum(entries, workers=5, delay=0.1, debug=False):
         cmd=["nuclei","-update-templates"]
         try:
             subprocess.run(cmd,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            sync_custom_cloud_templates(force=True)
         except FileNotFoundError:
             raise RuntimeError("nuclei binary not found; unable to update templates")
         except subprocess.CalledProcessError as exc:
@@ -302,6 +325,7 @@ def run_cloud_enum(entries, workers=5, delay=0.1, debug=False):
                         print(f"    processed {idx}/{len(wordlist)}")
 
     try:
+        sync_custom_cloud_templates()
         _execute(entries, retry=False)
         if retry_queue:
             retry_words=list(dict.fromkeys(retry_queue))
