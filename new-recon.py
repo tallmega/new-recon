@@ -30,6 +30,38 @@ try:
     _HAS_ALIVE=True
 except Exception:
     _HAS_ALIVE=False
+_TTY_DEBUG=os.environ.get("NEW_RECON_TTY_DEBUG")
+
+def _capture_tty_state():
+    if not sys.stdin.isatty():
+        return None
+    try:
+        result=subprocess.run(["stty","-g"],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        return result.stdout.strip()
+    except Exception:
+        return None
+
+def _debug_print(label,state):
+    if not _TTY_DEBUG:
+        return
+    msg=state or "unavailable"
+    try:
+        print(f"[dbg] tty state {label}: {msg}")
+    except Exception:
+        pass
+
+_ORIG_TTY_STATE=_capture_tty_state()
+_debug_print("entry",_ORIG_TTY_STATE)
+
+def _restore_tty_state():
+    if not _ORIG_TTY_STATE:
+        return
+    try:
+        subprocess.run(["stty",_ORIG_TTY_STATE],check=False,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    except Exception:
+        pass
+    else:
+        _debug_print("restored",_ORIG_TTY_STATE)
 def _tty_supports_alive() -> bool:
     if not sys.stdout.isatty():
         return False
@@ -49,6 +81,7 @@ else:
         except Exception:
             pass
     atexit.register(_restore_cursor)
+atexit.register(_restore_tty_state)
 
 LIKELY_HTTP_PORTS={80,81,3000,5000,7001,7080,7081,7443,8000,8008,8080,8081,8088,
                    8181,8443,8448,8880,8888,9000,9080,9090,9200,9443,10000,10443,
