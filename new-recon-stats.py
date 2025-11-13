@@ -145,6 +145,9 @@ SOFTWARE_SIGNATURES: List[Dict[str, object]] = [
     {"label": "WordPress", "keywords": ["wordpress", "wp-login", "wp-admin", "wp-content"]},
     {"label": "Microsoft Exchange / OWA", "keywords": ["microsoft exchange", "outlook web app", "owa"]},
     {"label": "Fortinet FortiGate VPN", "keywords": ["fortinet", "fortigate", "forticlient", "acme access only"]},
+    {"label": "Active Directory Federation Services (ADFS)",
+     "keywords": ["adfs/ls"],
+     "patterns": [r"200\s*->\s*/adfs/ls"]},
     {"label": "Palo Alto GlobalProtect", "keywords": ["globalprotect"]},
     {"label": "Cisco AnyConnect / ASA", "keywords": ["anyconnect", "cisco asa"]},
     {"label": "Citrix Gateway / NetScaler", "keywords": ["citrix gateway", "netscaler", "citrix adc"]},
@@ -630,11 +633,16 @@ def build_summary_lines(stats: StatsCollector, top_services: int, top_ports: int
         lines.append(f"Other notable platforms: {', '.join(highlight_segments)}")
 
     if stats.port_counter:
-        port_lines = []
-        for (proto, port), count in stats.port_counter.most_common(top_ports):
-            port_lines.append(f"{proto}/{port} ({count})")
+        items = sorted(
+            stats.port_counter.items(),
+            key=lambda kv: (-kv[1], kv[0][0], kv[0][1])
+        )
+        if top_ports > 0:
+            items = items[:top_ports]
+        port_lines = [f"{proto}/{port} ({count})" for (proto, port), count in items]
         if port_lines:
-            lines.append(f"Common observed ports: {', '.join(port_lines)}")
+            label = "Observed ports" if top_ports <= 0 else "Common observed ports"
+            lines.append(f"{label}: {', '.join(port_lines)}")
 
     third_party = sorted(stats.third_party_hits.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:top_third_party]
     if third_party:
@@ -653,7 +661,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize new-recon CSV or screenshot HTML output.")
     parser.add_argument("inputs", nargs="+", help="CSV or HTML files produced by new-recon tooling.")
     parser.add_argument("--top-services", type=int, default=6, help="How many software hits to list (default 6).")
-    parser.add_argument("--top-ports", type=int, default=5, help="How many ports to highlight (default 5).")
+    parser.add_argument("--top-ports", type=int, default=0, help="How many ports to highlight (0 means list all, default 0).")
     parser.add_argument("--top-third-party", type=int, default=5, help="How many third-party services to mention (default 5).")
     parser.add_argument("--output-html", help="Aggregated HTML report path (default: derive _output.html).")
     return parser.parse_args()

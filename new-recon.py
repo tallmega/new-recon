@@ -646,6 +646,10 @@ if __name__=="__main__":
                    help="Skip automatic follow-up scripts after CSV generation")
     a=p.parse_args()
 
+    if not a.standalone and not os.environ.get("OPENAI_API_KEY"):
+        print("[!] OPENAI_API_KEY is required unless --standalone is specified. Set the variable and rerun.")
+        sys.exit(1)
+
     ips=process_input_file(a.input) if a.input else set()
     fqdn_list=process_fqdn_file(a.fqdns) if a.fqdns else []
     if not a.domains and not fqdn_list and not ips:
@@ -703,7 +707,4 @@ if __name__=="__main__":
     outfile=f"new-recon-{safe_name(outfile_base)}_output.csv"
     write_csv(outfile,allres)
     if not a.standalone:
-        if os.environ.get("OPENAI_API_KEY"):
-            run_followup_pipeline(outfile)
-        else:
-            print("[!] OPENAI_API_KEY not set; skipping automated follow-up scripts. Use --standalone to suppress this warning.")
+        run_followup_pipeline(outfile)

@@ -664,6 +664,22 @@ def process_csv(input_path: str, output_path: Optional[str], max_hosts_per_row: 
                     else:
                         sigs[j] = code
 
+            # Heuristic Fortinet detection for ACME Access Only banner
+            for j in range(len(chunk)):
+                res = chunk[j]
+                blob = " ".join(
+                    filter(None,
+                        [res.get("stdout"), res.get("stderr"), res.get("follow_stdout"), res.get("follow_stderr"), notes[j]])
+                ).lower()
+                if "acme access only" in blob:
+                    existing_note = notes[j] or ""
+                    if "fortinet" not in existing_note.lower():
+                        prefix = "Fortinet FortiGate VPN portal (ACME Access Only banner). " if existing_note else "Fortinet FortiGate VPN portal (ACME Access Only banner)."
+                        notes[j] = prefix + existing_note
+                    sig = sigs[j] or ""
+                    if "fortinet" not in sig.lower():
+                        sigs[j] = f"{sig}|fortinet" if sig else "fortinet"
+
             notes = [normalize_http_label(n) for n in notes]
             notes_all.extend(notes)
             sigs_all.extend(sigs)

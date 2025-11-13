@@ -45,6 +45,8 @@ IPV4_RE=re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|
 IPV6_RE=re.compile(r"\b([0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
 
 SECTION_ORDER=["stats","cloudenum","screenshots"]
+SCRIPT_DIR=Path(__file__).resolve().parent
+DEFAULT_SCREENSHOT_ROOT=Path(os.environ.get("GOWITNESS_OUTPUT_ROOT", os.path.expanduser("~/gowitness-output")))
 
 HTML_STYLE_BLOCK=(
     "body{font-family:Arial,Helvetica,sans-serif;margin:20px;}"
@@ -82,6 +84,20 @@ def derive_output_html_path(sample_input: str, provided: Optional[str]) -> str:
     if name.endswith("_output.csv"):
         return str(path.with_name(name.replace("_output.csv","_output.html")))
     return str(path.with_suffix(path.suffix+".html"))
+
+def _sanitize_dir_component(value:str) -> str:
+    safe=re.sub(r"[^A-Za-z0-9._-]+","_", (value or "").strip())
+    return safe or "screenshots"
+
+def derive_screenshot_dir(input_csv:str, override:Optional[str]) -> str:
+    if override:
+        return os.path.abspath(override)
+    try:
+        stem=Path(input_csv).resolve().stem
+    except Exception:
+        stem=Path(input_csv).stem
+    safe=_sanitize_dir_component(stem)
+    return os.path.abspath(DEFAULT_SCREENSHOT_ROOT/safe)
 
 
 def _ensure_html_shell(path: str) -> None:
@@ -217,6 +233,19 @@ def path_variants(path:str) -> List[str]:
 
 def default_port_for_scheme(scheme:str) -> int:
     return 443 if scheme=="https" else 80
+
+def _preferred_scheme_for_port(port:int) -> str:
+    return port_scheme(port)
+
+def _score_screenshot_path(path:str,port:int) -> int:
+    if not path:
+        return -1
+    base=os.path.basename(path)
+    port_token=f"-{port}-"
+    port_score=2 if port_token in base else 0
+    scheme_hint="https" if base.startswith("https---") else ("http" if base.startswith("http---") else "")
+    scheme_score=1 if scheme_hint==_preferred_scheme_for_port(port) else 0
+    return port_score+scheme_score
 
 def _mapping_matches_target(value:Dict[str,str],target:Target) -> bool:
     url=value.get("url") or ""
@@ -889,8 +918,11 @@ def _merge_mapping_entry(mapping:Dict[Tuple[str,int,str],Dict[str,str]],key:Tupl
     if not existing:
         mapping[key]=data.copy()
         return
-    if data.get("path") and not existing.get("path"):
-        existing["path"]=data["path"]
+    port_hint=key[1]
+    new_path=data.get("path") or ""
+    old_path=existing.get("path") or ""
+    if new_path and (_score_screenshot_path(old_path,port_hint)<_score_screenshot_path(new_path,port_hint)):
+        existing["path"]=new_path
     if data.get("url"):
         existing["url"]=data["url"]
     if data.get("status"):
@@ -1206,7 +1238,7 @@ def main():
     p.add_argument("--max-hosts-per-row",type=int,default=25,help="Limit number of hostnames parsed per row.")
     p.add_argument("--include-boring",action="store_true",help="Include rows without interesting Notes/Nuclei.")
     p.add_argument("--targets-file",help="Where to write gowitness targets list (default: <screenshot-dir>/targets.txt).")
-    p.add_argument("--screenshot-dir",default="gowitness-output",help="gowitness screenshot directory.")
+    p.add_argument("--screenshot-dir",help="gowitness screenshot directory (default: gowitness-output/<csv-stem>).")
     p.add_argument("--gowitness-bin",default="gowitness",help="Path to gowitness binary (default: gowitness in PATH).")
     p.add_argument("--gowitness-threads",type=int,default=10,help="gowitness --threads value (default 10).")
     p.add_argument("--gowitness-timeout",type=int,default=25,help="gowitness --timeout value in seconds (default 25).")
@@ -1241,8 +1273,9 @@ def main():
             print(f"[i] Windows path: {win_path}")
         return
 
-    screenshot_dir=os.path.abspath(args.screenshot_dir)
+    screenshot_dir=derive_screenshot_dir(args.input_csv,args.screenshot_dir)
     targets_file=os.path.abspath(args.targets_file or os.path.join(screenshot_dir,"targets.txt"))
+    print(f"[i] Using screenshot directory: {screenshot_dir}")
     write_targets_file(all_targets,targets_file)
     print(f"[i] Wrote {total} targets -> {targets_file}")
 
