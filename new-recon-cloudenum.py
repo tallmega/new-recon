@@ -8,10 +8,12 @@ import re
 import subprocess
 import shutil
 import time
+import json
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from typing import Optional
@@ -23,14 +25,14 @@ except Exception:
 # above import replaced
 
 COMMON_TLDS={"com","net","org","ca","co","io","gov","edu","mil","int","biz","info"}
+SCRIPT_DIR=Path(__file__).resolve().parent
+MUTATIONS_FILE=SCRIPT_DIR/"wordlists"/"cloudfuzz.txt"
 GENERIC_SUFFIXES=[
     "companies","company","corp","corporation","group","services","service","solutions","solution",
     "systems","system","support","apps","app","cloud","online","portal","prod","production",
     "dev","development","stage","staging","test","testing","internal","intranet","net","web"
 ]
 GENERIC_PREFIXES={"the","my","app","portal","service"}
-MUTATIONS_FILE="./wordlists/cloudfuzz.txt"
-SCRIPT_DIR=Path(__file__).resolve().parent
 CUSTOM_CLOUD_TEMPLATE_DIR=SCRIPT_DIR/"templates"/"cloud"
 NUCLEI_TEMPLATE_ROOT=Path(os.environ.get("NUCLEI_TEMPLATES_DIR","./nuclei-templates"))
 NUCLEI_CLOUD_ENUM_DIR=NUCLEI_TEMPLATE_ROOT/"cloud"/"enum"
@@ -59,8 +61,7 @@ CATEGORY_LABELS={
 SECTION_ORDER=["stats","cloudenum","screenshots"]
 
 CLOUD_INTRO=(
-    "<p>Testers also discovered the following Cloud based Platform as a Service (PaaS) resources that may belong to the organization. "
-    "Assets marked as 'Protected' were determined to be inaccessible by testers.</p>"
+    "<p>Testers also discovered the following Cloud based Platform as a Service (PaaS) resources that may belong to the organization.</p>"
 )
 
 HTML_STYLE_BLOCK=(
@@ -202,20 +203,24 @@ def build_names(base_list,mutations):
     return results
 
 
-def sync_custom_cloud_templates(force:bool=False) -> None:
+def sync_custom_cloud_templates(force:bool=False, verbose:bool=False) -> None:
     source_dir=CUSTOM_CLOUD_TEMPLATE_DIR
     if not source_dir.is_dir():
+        if verbose:
+            print(f"Custom template directory missing ({source_dir}); skipping sync.")
         return
     dest_dir=NUCLEI_CLOUD_ENUM_DIR
     dest_dir.mkdir(parents=True,exist_ok=True)
     copied=False
-    for template_path in source_dir.glob("*.yaml"):
+    for template_path in source_dir.glob("**/*.yaml"):
         target_path=dest_dir/template_path.name
         if force or not target_path.exists():
             shutil.copy2(template_path,target_path)
             copied=True
     if copied:
         print(f"[i] Installed custom cloud enum templates into {dest_dir}")
+    elif verbose:
+        print("Custom templates already present; no copies needed.")
 
 
 def pick_keywords(base_counter,root_counter,base_limit=BASE_LIMIT,root_limit=ROOT_LIMIT):
@@ -247,7 +252,7 @@ def run_cloud_enum(entries, workers=5, delay=0.1, debug=False):
         cmd=["nuclei","-update-templates"]
         try:
             subprocess.run(cmd,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-            sync_custom_cloud_templates(force=True)
+            sync_custom_cloud_templates(force=True, verbose=debug)
         except FileNotFoundError:
             raise RuntimeError("nuclei binary not found; unable to update templates")
         except subprocess.CalledProcessError as exc:
@@ -266,28 +271,53 @@ def run_cloud_enum(entries, workers=5, delay=0.1, debug=False):
             f"wordlist={word}",
         ]
         if debug:
-            print("[dbg] "+" ".join(cmd))
+            print("Running nuclei command:", " ".join(cmd))
         try:
             result=subprocess.run(cmd,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             output=(result.stdout or "").strip()
+            if debug and output:
+                print(f"nuclei stdout for {word}:\n{output}")
             if output:
                 for line in output.splitlines():
                     line=line.strip()
                     if not line:
                         continue
-                    match=re.match(r"\[[^\]]+:([^\]]+)\]\s+\[[^\]]+\]\s+\[[^\]]+\]\s+(\S+)",line)
+                    match=re.match(r"\[([^\]:]+):([^\]]+)\]\s+\[[^\]]+\]\s+\[[^\]]+\]\s+(\S+)",line)
                     if match:
-                        name=match.group(1).strip()
-                        url=match.group(2).strip()
-                        category=CATEGORY_LABELS.get(name,name)
-                        with lock:
-                            findings[category].add(url)
+                        template_id=match.group(1).strip()
+                        friendly_name=match.group(2).strip()
+                        raw_url=match.group(3).strip()
+                        category=CATEGORY_LABELS.get(template_id,friendly_name)
+                        urls_to_add=[]
+                        if raw_url.startswith("["):
+                            try:
+                                parsed=json.loads(raw_url)
+                                if isinstance(parsed,list):
+                                    urls_to_add=[str(u).strip() for u in parsed if str(u).strip()]
+                            except Exception:
+                                urls_to_add=[raw_url.strip("[]\"")]
+                        else:
+                            urls_to_add=[raw_url.strip()]
+                        if template_id=="azure-storage-account-enum":
+                            preferred={}
+                            for candidate in urls_to_add:
+                                parsed=urlparse(candidate)
+                                host=parsed.netloc.lower()
+                                current=preferred.get(host)
+                                if not current or (current.startswith("http://") and candidate.startswith("https://")):
+                                    preferred[host]=candidate
+                            urls_to_add=list(preferred.values())
+                        for url in urls_to_add:
+                            with lock:
+                                findings[category].add(url)
+                            if debug or template_id=="azure-storage-account-enum":
+                                print(f"Template '{friendly_name}' reported: {url}")
                     if debug:
                         print(line)
             elif debug:
                 err=(result.stderr or "").strip()
                 if err:
-                    print(err)
+                    print(f"nuclei stderr for {word}:\n{err}")
         except FileNotFoundError:
             raise RuntimeError("nuclei binary not found; aborting cloud enumeration")
         except subprocess.CalledProcessError as exc:
@@ -325,7 +355,7 @@ def run_cloud_enum(entries, workers=5, delay=0.1, debug=False):
                         print(f"    processed {idx}/{len(wordlist)}")
 
     try:
-        sync_custom_cloud_templates()
+        sync_custom_cloud_templates(verbose=debug)
         _execute(entries, retry=False)
         if retry_queue:
             retry_words=list(dict.fromkeys(retry_queue))

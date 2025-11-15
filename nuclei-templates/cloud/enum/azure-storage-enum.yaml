@@ -28,7 +28,6 @@ http:
     redirects: false
     threads: 10
 
-    # Single matcher name, multiple body patterns -> "this account exists"
     matchers:
       - type: word
         name: "Azure Storage Account"
@@ -41,10 +40,12 @@ http:
           - "AuthorizationPermissionMismatch"
         condition: or
 
-    # Clean output URL for post-processing / feeding into other tools
     extractors:
       - type: dsl
-        name: storage-account
+        name: storage-account-https
         dsl:
           - '"https://" + wordlist + "." + BaseDNS'
-        internal: false
+      - type: dsl
+        name: storage-account-http
+        dsl:
+          - '"http://" + wordlist + "." + BaseDNS'

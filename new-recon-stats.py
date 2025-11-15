@@ -123,22 +123,7 @@ def _prep_signature_list(signatures: List[Dict[str, object]]) -> None:
         if "patterns" in entry and entry["patterns"]:
             entry["patterns"] = [re.compile(pattern, re.IGNORECASE) for pattern in entry["patterns"]]  # type: ignore
 
-PRIORITY_SOFTWARE = [
-    "WordPress",
-    "SharePoint",
-    "Microsoft Exchange / OWA",
-    "Fortinet FortiGate VPN",
-    "Palo Alto GlobalProtect",
-    "Cisco AnyConnect / ASA",
-    "Citrix Gateway / NetScaler",
-    "Craft CMS",
-    "Magnolia CMS",
-    "BeyondTrust Remote Assist",
-    "OpenCart",
-    "Telus Business Connect",
-    "VPN Internet Key Exchange (IKE)",
-    "RDP",
-]
+PRIORITY_SOFTWARE: List[str] = []
 
 
 SOFTWARE_SIGNATURES: List[Dict[str, object]] = [
@@ -175,12 +160,14 @@ SOFTWARE_SIGNATURES: List[Dict[str, object]] = [
     {"label": "IBM HTTP Server / WebSphere", "keywords": ["ibm http server", "ibm_http_server", "websphere"]},
     {"label": "F5 BIG-IP", "keywords": ["big-ip", "f5 networks"]},
     {"label": "Linksys", "keywords": ["linksys"]},
+    {"label": "Synology", "keywords": ["synology", "synology diskstation"]},
+    {"label": "QNAP", "keywords": ["qnap"]},
     {"label": "BeyondTrust Remote Assist", "keywords": ["beyondtrust remoteassist", "beyondtrust remote support", "beyondtrust-remotesupport"]},
     {"label": "Morley Insurance Exchange", "keywords": ["morley insurance exchange"]},
     {"label": "VPN Internet Key Exchange (IKE)", "keywords": ["ike", "ipsec", "internet key exchange", "isakmp"],
      "ports": {("udp", 500), ("udp", 4500)}},
     {"label": "RDP", "ports": {("tcp", 3389)}},
-    {"label": "SonicWall VPN", "keywords": ["sonicwall"]},
+    {"label": "SonicWall VPN", "keywords": ["sonicwall", "sonicui"]},
     {"label": "Fortinet SSL VPN Portal", "keywords": ["fortisslvpn", "fortinet ssl vpn"]},
     {"label": "vSphere / ESXi", "keywords": ["vmware vsphere", "esxi"]},
 ]
@@ -618,19 +605,8 @@ def build_summary_lines(stats: StatsCollector, top_services: int, top_ports: int
     lines.append(f"{pluralize(stats.ip_count, 'unique active IP address', 'unique active IP addresses')}")
 
     software_counts = sorted(stats.software_hits.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    top_labels:Set[str]=set()
     for label, entries in software_counts[:top_services]:
         lines.append(f"{pluralize(len(entries), 'instance')} of {label}")
-        top_labels.add(label)
-    highlight_segments=[]
-    for label in PRIORITY_SOFTWARE:
-        if label in top_labels:
-            continue
-        entries=stats.software_hits.get(label)
-        if entries:
-            highlight_segments.append(f"{pluralize(len(entries), 'instance')} of {label}")
-    if highlight_segments:
-        lines.append(f"Other notable platforms: {', '.join(highlight_segments)}")
 
     if stats.port_counter:
         items = sorted(
@@ -660,7 +636,7 @@ def build_summary_lines(stats: StatsCollector, top_services: int, top_ports: int
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize new-recon CSV or screenshot HTML output.")
     parser.add_argument("inputs", nargs="+", help="CSV or HTML files produced by new-recon tooling.")
-    parser.add_argument("--top-services", type=int, default=6, help="How many software hits to list (default 6).")
+    parser.add_argument("--top-services", type=int, default=20, help="How many software hits to list (default 20).")
     parser.add_argument("--top-ports", type=int, default=0, help="How many ports to highlight (0 means list all, default 0).")
     parser.add_argument("--top-third-party", type=int, default=5, help="How many third-party services to mention (default 5).")
     parser.add_argument("--output-html", help="Aggregated HTML report path (default: derive _output.html).")
